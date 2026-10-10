@@ -71,12 +71,16 @@ static void StripGitSuffix(char *s) {
     if (n > 4 && _stricmp(s + n - 4, ".git") == 0) s[n - 4] = 0;
 }
 
-void SourceApiHost(const char *url, SourceKind kind, char *out, size_t n) {
-    if (kind == SRC_AUTO) kind = SourceDetect(url);
-    if (kind == SRC_GITHUB) { snprintf(out, n, "api.github.com"); return; }
+static int UsesGitHubWeb(const SourceCfg *cfg, SourceKind kind) {
+    return kind == SRC_GITHUB && cfg->noApi && !cfg->prerelease;   // /releases/latest はプレリリースを含まない
+}
+
+void SourceApiHost(const SourceCfg *cfg, char *out, size_t n) {
+    SourceKind kind = cfg->kind == SRC_AUTO ? SourceDetect(cfg->url) : cfg->kind;
+    if (kind == SRC_GITHUB) { snprintf(out, n, UsesGitHubWeb(cfg, kind) ? "github.com" : "api.github.com"); return; }
     UrlParts u;
-    if (SplitUrl(url, &u)) { snprintf(out, n, "%s", u.host); free(u.path); }
-    else snprintf(out, n, "%s", url);
+    if (SplitUrl(cfg->url, &u)) { snprintf(out, n, "%s", u.host); free(u.path); }
+    else snprintf(out, n, "%s", cfg->url);
 }
 
 SourceKind SourceDetect(const char *url) {
@@ -810,6 +814,93 @@ static int FromWebPage(const SourceCfg *cfg, Latest *out) {
     return 1;
 }
 
+// ---------------------------------------------------------------- GitHub（API を使わない）
+
+// API は トークン無しだと IP ごとに 1 時間 60 回までなので、ダウンロードの前の調べ直しは普通のページで行う。
+//   /releases/latest は最新リリース（プレリリースと下書きを除く）の /releases/tag/<タグ> へ転送される
+//   /releases/expanded_assets/<タグ> は、そのリリースの添付ファイルの一覧（HTML の断片）
+// どちらも API の回数には数えられない（2026-10-11 に実測）。
+static int FromGitHubWeb(const SourceCfg *cfg, Latest *out) {
+    UrlParts u;
+    if (!SplitUrl(cfg->url, &u)) { SetErr(out, "URL の形式が正しくない", NULL); return 0; }
+    char segs[2][256];
+    int ns = PathSegments(u.path, segs, 2);
+    free(u.path);
+    if (ns < 2) { SetErr(out, "URL にリポジトリ（所有者/名前）が含まれていない", NULL); return 0; }
+    StripGitSuffix(segs[1]);
+    out->title = U8Dup(segs[1]);
+
+    char *latest = U8Fmt("https://github.com/%s/%s/releases/latest", segs[0], segs[1]);
+    HttpResp r;
+    int ok = HttpGet(latest, NULL, 1, &r, out->err, sizeof(out->err));
+    free(latest);
+    if (!ok) return 0;
+    if (r.status != 200) {
+        NoteRateLimit(&r, out);
+        char *e = HttpErrorText(&r, "リポジトリ");
+        SetErr(out, "%s", e);
+        free(e);
+        HttpRespFree(&r);
+        return 0;
+    }
+    const char *t = r.finalUrl ? strstr(r.finalUrl, "/releases/tag/") : NULL;
+    if (!t) { HttpRespFree(&r); SetErr(out, "リリースが 1 つも無い（プレリリースを除く）", NULL); return 0; }
+    t += 14;
+    char *tagEnc = U8NDup(t, strcspn(t, "?#"));
+    char *tag = PercentDecode(tagEnc);
+    out->page = U8Dup(r.finalUrl);
+    HttpRespFree(&r);
+
+    char *assets = U8Fmt("https://github.com/%s/%s/releases/expanded_assets/%s", segs[0], segs[1], tagEnc);
+    ok = HttpGet(assets, "Accept: text/html", 0, &r, out->err, sizeof(out->err));
+    free(assets);
+    free(tagEnc);
+    if (!ok) { free(tag); return 0; }
+    if (r.status != 200) {
+        NoteRateLimit(&r, out);
+        char *e = HttpErrorText(&r, "添付ファイルの一覧");
+        SetErr(out, "%s", e);
+        free(e);
+        HttpRespFree(&r);
+        free(tag);
+        return 0;
+    }
+    // 添付ファイルは /所有者/名前/releases/download/<タグ>/<ファイル名> へのリンクとして並んでいる
+    StrList links = {0};
+    for (const char *p = r.body.p; (p = strstr(p, "href=\"")) != NULL;) {
+        p += 6;
+        size_t n = strcspn(p, "\"");
+        char *href = DecodeEntities(p, n);
+        if (strstr(href, "/releases/download/")) ListAddUnique(&links, href[0] == '/' ? U8Fmt("https://github.com%s", href) : U8Dup(href));
+        free(href);
+        p += n;
+    }
+    HttpRespFree(&r);
+    for (int i = 0; i < links.n; i++) {
+        char *name = LastSegment(links.v[i]);
+        AddCand(out, name, links.v[i], NULL, WindowsScore(name));
+        free(name);
+    }
+    ListFree(&links);
+
+    Rules rules;
+    if (!CompileRules(cfg, &rules, out, NULL)) { free(tag); return 0; }
+    int pick = ChooseByScore(out, &rules);
+    if (pick >= 0) {
+        out->chosen = pick;
+        out->fileUrl = U8Dup(out->cands[pick].url);
+        out->fileName = U8Dup(out->cands[pick].name);
+        out->version = ExtractVersion(rules.verRx, tag);
+        if (!out->version && rules.verRx) out->version = ExtractVersion(rules.verRx, out->fileName);
+        if (!out->version) out->version = U8Dup(tag);
+    } else {
+        snprintf(out->err, sizeof(out->err), "条件に合うファイルが無い（最新 %s、添付 %d 件）", tag, out->ncand);
+    }
+    FreeRules(&rules);
+    free(tag);
+    return pick >= 0;
+}
+
 // ---------------------------------------------------------------- Firefox アドオン（AMO）
 
 // https://addons.mozilla.org/ja/firefox/addon/<slug>/ の <slug>（数字の ID や GUID でもよい）で API を引く
@@ -879,6 +970,7 @@ int SourceLatest(const SourceCfg *cfg, Latest *out) {
     out->chosen = -1;
     out->kind = cfg->kind == SRC_AUTO ? SourceDetect(cfg->url) : cfg->kind;
     if (out->kind == SRC_WEB) out->ok = FromWebPage(cfg, out);
+    else if (UsesGitHubWeb(cfg, out->kind)) out->ok = FromGitHubWeb(cfg, out);
     else if (out->kind == SRC_AMO) out->ok = FromAmo(cfg, out);
     else out->ok = FromReleases(cfg, out);
     return out->ok;

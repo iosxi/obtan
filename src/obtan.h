@@ -12,7 +12,7 @@
 #include <stddef.h>
 
 #define APP_NAME    L"obtan"
-#define APP_VERSION "4"
+#define APP_VERSION "5"
 
 // ---------------------------------------------------------------- util.c
 
@@ -113,6 +113,7 @@ typedef struct {
     const char *verRx;       // 版の取り出し（正規表現、空なら自動）
     int         prerelease;
     const char *token;       // GitHub トークン（任意）
+    int         noApi;       // GitHub を API ではなく普通のページで調べる（回数制限に数えられない）
 } SourceCfg;
 
 typedef struct {
@@ -133,7 +134,7 @@ typedef struct {
 
 const char *SourceName(SourceKind k);
 SourceKind  SourceDetect(const char *url);
-void        SourceApiHost(const char *url, SourceKind kind, char *out, size_t n);   // 回数制限を数える単位
+void        SourceApiHost(const SourceCfg *cfg, char *out, size_t n);   // 回数制限を数える単位
 int         SourceLatest(const SourceCfg *cfg, Latest *out);
 void        LatestFree(Latest *l);
 

@@ -92,11 +92,15 @@ typedef struct Job {
     int   kind, prerelease;
     char *url, *filter, *verRx, *token;
     WCHAR dest[MAX_PATH];
+    int   skipSame;          // 取得済みの版と同じで、ファイルも残っていれば落とさない（「すべてダウンロード」）
+    char *installed;
+    WCHAR file[MAX_PATH];
 } Job;
 
 typedef struct {
     int   type, id, automatic, ok;
     long long deferUntil;    // 回数制限で見送った（この時刻に再開）
+    int   skipped;           // 取得済みと同じ版だったので落とさなかった
     WCHAR err[512];
     WCHAR version[128], fileName[260], page[1024];
     WCHAR path[MAX_PATH];
@@ -745,14 +749,15 @@ static JobResult *RunJob(const Job *j) {
     r->id = j->id;
     r->automatic = j->automatic;
     // 制限に当たっているホストには、解除の時刻まで問い合わせない（残りの登録をまとめてエラーにしないため）
+    // ダウンロードの前の調べ直しは、GitHub なら API を使わない（API の回数は確認のためだけに使う）
+    SourceCfg cfg = { j->url, (SourceKind)j->kind, j->filter, j->verRx, j->prerelease, j->token, j->type == JOB_DOWNLOAD };
     char host[128];
-    SourceApiHost(j->url, (SourceKind)j->kind, host, sizeof(host));
+    SourceApiHost(&cfg, host, sizeof(host));
     long long until = BlockedUntil(host);
     if (until > NowUnix()) {
         r->deferUntil = until;
         return r;
     }
-    SourceCfg cfg = { j->url, (SourceKind)j->kind, j->filter, j->verRx, j->prerelease, j->token };
     Latest l;
     SourceLatest(&cfg, &l);
     if (l.retryAt) {
@@ -771,6 +776,12 @@ static JobResult *RunJob(const Job *j) {
     WCopyU8(r->fileName, _countof(r->fileName), l.fileName);
     WCopyU8(r->page, _countof(r->page), l.page);
 
+    if (j->type == JOB_DOWNLOAD && j->skipSame && !VersionIsNewer(l.version, j->installed) &&
+        j->file[0] && GetFileAttributesW(j->file) != INVALID_FILE_ATTRIBUTES) {
+        r->skipped = 1;   // もう持っている
+        LatestFree(&l);
+        return r;
+    }
     if (j->type == JOB_DOWNLOAD) {
         int rc = SHCreateDirectoryExW(NULL, j->dest, NULL);
         if (rc != ERROR_SUCCESS && rc != ERROR_ALREADY_EXISTS && rc != ERROR_FILE_EXISTS) {
@@ -808,6 +819,7 @@ static void FreeJob(Job *j) {
     free(j->filter);
     free(j->verRx);
     free(j->token);
+    free(j->installed);
     free(j);
 }
 
@@ -838,12 +850,15 @@ static DWORD WINAPI WorkerProc(void *arg) {
 static void UpdateRow(const App *a);
 static void UpdateStatusBar(void);
 
-static void Enqueue(App *a, int type, int automatic) {
+static void EnqueueEx(App *a, int type, int automatic, int skipSame) {
     // 同じアプリの仕事が待っているなら、ダウンロードの方を優先して 1 つにまとめる
     if (a->queued >= type) return;
     Job *j = (Job *)calloc(1, sizeof(Job));
     if (!j) return;
     j->type = type;
+    j->skipSame = skipSame;
+    j->installed = W2U(a->installed);
+    WCopy(j->file, _countof(j->file), a->file);
     j->id = a->id;
     j->automatic = automatic;
     j->kind = a->kind;
@@ -882,6 +897,8 @@ static void Enqueue(App *a, int type, int automatic) {
     UpdateRow(a);
     UpdateStatusBar();
 }
+
+static void Enqueue(App *a, int type, int automatic) { EnqueueEx(a, type, automatic, 0); }
 
 static void DropQueued(int id) {
     EnterCriticalSection(&g_qlock);
@@ -1531,11 +1548,13 @@ static void OnCommand(int id) {
     case ID_DELETE: DeleteSelected(); break;
     case ID_CHECKALL: CheckAll(0); break;
     case ID_GETALL: {
+        // チェックの付いたものを、確認なしでまとめて落とす。GitHub は API を使わずに調べるので回数を減らさない。
+        // 取得済みと同じ版でファイルも残っているものは落とさない
         int count = 0;
         for (int i = 0; i < g_napps; i++)
-            if (g_apps[i]->enabled && AppHasUpdate(g_apps[i]) && !g_apps[i]->error[0]) { Enqueue(g_apps[i], JOB_DOWNLOAD, 0); count++; }
+            if (g_apps[i]->enabled) { EnqueueEx(g_apps[i], JOB_DOWNLOAD, 0, 1); count++; }
         if (!count)
-            MessageBoxW(g_main, L"ダウンロードを待っている新しい版はありません。\n（先に「すべて確認」で確かめてください）", APP_NAME, MB_ICONINFORMATION);
+            MessageBoxW(g_main, L"チェックの付いた登録がありません。", APP_NAME, MB_ICONINFORMATION);
         break;
     }
     case ID_SETTINGS:
@@ -1597,7 +1616,7 @@ static void OnJobDone(JobResult *r) {
     } else {
         WCopy(a->error, _countof(a->error), r->err);
     }
-    if (r->type == JOB_DOWNLOAD && r->ok) {
+    if (r->type == JOB_DOWNLOAD && r->ok && !r->skipped) {
         WCopy(a->installed, _countof(a->installed), r->version);
         WCopy(a->file, _countof(a->file), r->path);
         if (r->automatic) {
@@ -1711,7 +1730,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_main = hwnd;
         g_dpi = GetDpiForWindow(hwnd);
         RecreateFont();
-        static const WCHAR *labels[6] = { L"追加...", L"編集...", L"削除", L"すべて確認", L"新しい版をすべて取得", L"設定..." };
+        static const WCHAR *labels[6] = { L"追加...", L"編集...", L"削除", L"すべて確認", L"すべてダウンロード", L"設定..." };
         static const int ids[6] = { ID_ADD, ID_EDIT, ID_DELETE, ID_CHECKALL, ID_GETALL, ID_SETTINGS };
         for (int i = 0; i < 6; i++)
             g_buttons[i] = CreateWindowExW(0, L"BUTTON", labels[i], WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
@@ -1988,12 +2007,12 @@ static int SelfTest(void) {
     return fail ? 1 : 0;
 }
 
-// -probe <url> [-kind github|gitlab|gitea|web|amo] [-filter re] [-ver re] [-pre] [-token t] [-dl dir]
+// -probe <url> [-kind github|gitlab|gitea|web|amo] [-filter re] [-ver re] [-pre] [-noapi] [-token t] [-dl dir]
 static int Probe(int argc, WCHAR **argv) {
     char *url = NULL, *filter = NULL, *ver = NULL, *token = NULL;
     WCHAR *dl = NULL;
     SourceKind kind = SRC_AUTO;
-    int pre = 0;
+    int pre = 0, noApi = 0;
     for (int i = 1; i < argc; i++) {
         if (!_wcsicmp(argv[i], L"-probe") && i + 1 < argc) url = W2U(argv[++i]);
         else if (!_wcsicmp(argv[i], L"-filter") && i + 1 < argc) filter = W2U(argv[++i]);
@@ -2001,6 +2020,7 @@ static int Probe(int argc, WCHAR **argv) {
         else if (!_wcsicmp(argv[i], L"-token") && i + 1 < argc) token = W2U(argv[++i]);
         else if (!_wcsicmp(argv[i], L"-dl") && i + 1 < argc) dl = argv[++i];
         else if (!_wcsicmp(argv[i], L"-pre")) pre = 1;
+        else if (!_wcsicmp(argv[i], L"-noapi")) noApi = 1;
         else if (!_wcsicmp(argv[i], L"-kind") && i + 1 < argc) {
             i++;
             if (!_wcsicmp(argv[i], L"github")) kind = SRC_GITHUB;
@@ -2010,7 +2030,7 @@ static int Probe(int argc, WCHAR **argv) {
             else if (!_wcsicmp(argv[i], L"amo")) kind = SRC_AMO;
         }
     }
-    SourceCfg cfg = { url, kind, filter, ver, pre, token };
+    SourceCfg cfg = { url, kind, filter, ver, pre, token, noApi };
     Latest l;
     SourceLatest(&cfg, &l);
     char *text = FormatLatest(&l, "\n");
