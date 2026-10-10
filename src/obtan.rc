@@ -1,0 +1,96 @@
+#pragma code_page(65001)
+#include <windows.h>
+#include "resource.h"
+
+IDI_APP ICON "obtan.ico"
+CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "obtan.manifest"
+
+IDD_APP DIALOGEX 0, 0, 360, 350
+STYLE DS_MODALFRAME | DS_SHELLFONT | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "アプリの登録"
+FONT 9, "Yu Gothic UI", 400, 0, 0x80
+BEGIN
+    LTEXT           "URL:", -1, 10, 10, 70, 10
+    EDITTEXT        IDC_URL, 82, 8, 214, 13, ES_AUTOHSCROLL
+    PUSHBUTTON      "調べる", IDC_PROBE_BTN, 300, 7, 50, 15
+    LTEXT           "GitHub・GitLab・Codeberg のリポジトリか、ダウンロードのリンクがあるページ", IDC_HINT1, 82, 24, 268, 10
+
+    LTEXT           "名前:", -1, 10, 41, 70, 10
+    EDITTEXT        IDC_NAME, 82, 39, 120, 13, ES_AUTOHSCROLL
+    LTEXT           "取得元:", -1, 210, 41, 30, 10
+    COMBOBOX        IDC_KIND, 242, 39, 108, 100, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+
+    LTEXT           "ファイル名の条件:", -1, 10, 60, 70, 10
+    EDITTEXT        IDC_FILTER, 82, 58, 268, 13, ES_AUTOHSCROLL
+    LTEXT           "正規表現（大文字小文字は区別しない）。空欄なら Windows 向けらしいファイルを自動で選ぶ。Web ページでは空欄だと .exe .msi .zip .7z などへのリンクが対象。例: x64.*\\.zip$", IDC_HINT2, 82, 73, 268, 26
+
+    LTEXT           "版の取り出し:", -1, 10, 104, 70, 10
+    EDITTEXT        IDC_VERRX, 82, 102, 268, 13, ES_AUTOHSCROLL
+    LTEXT           "正規表現。( ) で囲んだ部分を版とする。空欄なら自動（リリースはタグ名、Web ページはファイル名から）。例: -v(\\d+)\\.zip", IDC_HINT3, 82, 117, 268, 18
+
+    AUTOCHECKBOX    "プレリリースも対象にする", IDC_PRE, 82, 138, 200, 11
+
+    LTEXT           "保存先フォルダ:", -1, 10, 157, 70, 10
+    EDITTEXT        IDC_DEST, 82, 155, 214, 13, ES_AUTOHSCROLL
+    PUSHBUTTON      "参照...", IDC_DEST_BROWSE, 300, 154, 50, 15
+    LTEXT           "", IDC_DEST_HINT, 82, 170, 268, 10, SS_PATHELLIPSIS
+    AUTOCHECKBOX    "新しい版が見つかったら自動でダウンロードする", IDC_AUTODL, 82, 184, 260, 11
+
+    LTEXT           "取得済みの版:", -1, 10, 203, 70, 10
+    EDITTEXT        IDC_INSTALLED, 82, 201, 100, 13, ES_AUTOHSCROLL
+    LTEXT           "ダウンロードすると自動で入る。手で直してもよい", IDC_HINT4, 188, 203, 162, 10
+
+    GROUPBOX        "調べた結果", -1, 10, 220, 340, 102
+    EDITTEXT        IDC_PROBE_OUT, 16, 232, 328, 84, ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | ES_AUTOHSCROLL | WS_VSCROLL | WS_HSCROLL
+
+    DEFPUSHBUTTON   "OK", IDOK, 236, 329, 54, 15
+    PUSHBUTTON      "キャンセル", IDCANCEL, 296, 329, 54, 15
+END
+
+IDD_SETTINGS DIALOGEX 0, 0, 300, 186
+STYLE DS_MODALFRAME | DS_SHELLFONT | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "設定"
+FONT 9, "Yu Gothic UI", 400, 0, 0x80
+BEGIN
+    LTEXT           "既定の保存先:", -1, 10, 10, 280, 10
+    EDITTEXT        IDC_DEFDIR, 10, 22, 226, 13, ES_AUTOHSCROLL
+    PUSHBUTTON      "参照...", IDC_DEFDIR_BROWSE, 240, 21, 50, 15
+    LTEXT           "保存先フォルダを指定していないアプリは、この下の「名前」のフォルダに保存する。", IDC_HINT5, 10, 38, 280, 10
+
+    LTEXT           "確認の間隔:", -1, 10, 58, 56, 10
+    EDITTEXT        IDC_INTERVAL, 68, 56, 30, 13, ES_NUMBER | ES_RIGHT
+    LTEXT           "時間ごと（0 にすると自動では確認しない）", -1, 104, 58, 186, 10
+
+    AUTOCHECKBOX    "Windows の起動時にトレイで起動する", IDC_AUTOSTART, 10, 76, 280, 11
+    AUTOCHECKBOX    "閉じるボタンでトレイにしまう（終了はトレイのメニューから）", IDC_TRAYCLOSE, 10, 90, 280, 11
+    AUTOCHECKBOX    "新しい版の発見と自動ダウンロードを通知する", IDC_NOTIFY, 10, 104, 280, 11
+
+    LTEXT           "GitHub トークン（任意）:", -1, 10, 122, 280, 10
+    EDITTEXT        IDC_TOKEN, 10, 134, 280, 13, ES_PASSWORD | ES_AUTOHSCROLL
+    LTEXT           "GitHub の API は 1 時間 60 回まで。トークンを入れると 5000 回まで増える。", IDC_HINT6, 10, 149, 280, 10
+
+    DEFPUSHBUTTON   "OK", IDOK, 176, 165, 54, 15
+    PUSHBUTTON      "キャンセル", IDCANCEL, 236, 165, 54, 15
+END
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION 1,0,0,0
+PRODUCTVERSION 1,0,0,0
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "041104B0"
+        BEGIN
+            VALUE "FileDescription", "obtan - アプリの新しい版を見張ってダウンロードする"
+            VALUE "ProductName", "obtan"
+            VALUE "FileVersion", "1"
+            VALUE "ProductVersion", "1"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x411, 1200
+    END
+END
