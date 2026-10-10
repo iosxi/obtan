@@ -12,6 +12,7 @@
 #include <shlobj.h>
 #include <shobjidl.h>
 #include <uxtheme.h>
+#include <vssym32.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -234,6 +235,87 @@ static LRESULT CALLBACK GroupBoxSubclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
     return DefSubclassProc(hwnd, msg, wp, lp);
 }
 
+// 入力欄の縁（WS_EX_CLIENTEDGE の 2px）はダークでもテーマが明るい線で描くので、ダーク時は描き直す。
+// 入力中の欄だけアクセントの色にする。
+static LRESULT CALLBACK EditSubclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR id, DWORD_PTR ref) {
+    (void)id; (void)ref;
+    LRESULT r = DefSubclassProc(hwnd, msg, wp, lp);
+    if (msg == WM_SETFOCUS || msg == WM_KILLFOCUS || msg == WM_ENABLE) {
+        RedrawWindow(hwnd, NULL, NULL, RDW_FRAME | RDW_INVALIDATE);
+    } else if (msg == WM_NCPAINT && g_dark) {
+        int edge = (GetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_CLIENTEDGE) ? 2 : (GetWindowLongW(hwnd, GWL_STYLE) & WS_BORDER) ? 1 : 0;
+        if (edge) {
+            HDC dc = GetWindowDC(hwnd);
+            RECT rc;
+            GetWindowRect(hwnd, &rc);
+            OffsetRect(&rc, -rc.left, -rc.top);
+            HBRUSH line = CreateSolidBrush(GetFocus() == hwnd ? ThemeAccent() : RGB(0x5a, 0x5a, 0x5a));
+            FrameRect(dc, &rc, line);
+            if (edge == 2) {
+                InflateRect(&rc, -1, -1);
+                FrameRect(dc, &rc, g_brPanel);
+            }
+            DeleteObject(line);
+            ReleaseDC(hwnd, dc);
+        }
+    }
+    return r;
+}
+
+// チェックボックスの文字はテーマが描くが、Windows 11 23H2 のダークテーマは黒で描いてしまう
+// （WM_CTLCOLORBTN の文字色は効かない）。ダーク時は四角だけテーマで描き、文字はこちらで描く。
+static BOOL DrawDarkCheckbox(NMCUSTOMDRAW *cd, LRESULT *result) {
+    HWND h = cd->hdr.hwndFrom;
+    WCHAR cls[16] = L"";
+    GetClassNameW(h, cls, _countof(cls));
+    LONG type = GetWindowLongW(h, GWL_STYLE) & BS_TYPEMASK;
+    if (!g_dark || _wcsicmp(cls, L"Button") != 0 || (type != BS_AUTOCHECKBOX && type != BS_CHECKBOX)) return FALSE;
+    if (cd->dwDrawStage != CDDS_PREPAINT) return FALSE;
+
+    HDC dc = cd->hdc;
+    RECT rc = cd->rc;
+    UINT st = cd->uItemState;
+    int dpi = (int)GetDpiForWindow(h);
+    FillRect(dc, &rc, g_brFace);
+    BOOL checked = SendMessageW(h, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    int state = (checked ? CBS_CHECKEDNORMAL : CBS_UNCHECKEDNORMAL) +
+                ((st & CDIS_DISABLED) ? 3 : (st & CDIS_SELECTED) ? 2 : (st & CDIS_HOT) ? 1 : 0);
+    SIZE box = { MulDiv(13, dpi, 96), MulDiv(13, dpi, 96) };
+    HTHEME th = OpenThemeData(h, L"Button");
+    if (th) GetThemePartSize(th, dc, BP_CHECKBOX, state, NULL, TS_DRAW, &box);
+    RECT br = { rc.left, rc.top + (rc.bottom - rc.top - box.cy) / 2, 0, 0 };
+    br.right = br.left + box.cx;
+    br.bottom = br.top + box.cy;
+    if (th) {
+        DrawThemeBackground(th, dc, BP_CHECKBOX, state, &br, NULL);
+        CloseThemeData(th);
+    } else {
+        DrawFrameControl(dc, &br, DFC_BUTTON, DFCS_BUTTONCHECK | (checked ? DFCS_CHECKED : 0));
+    }
+
+    WCHAR text[256] = L"";
+    GetWindowTextW(h, text, _countof(text));
+    HFONT old = (HFONT)SelectObject(dc, (HFONT)SendMessageW(h, WM_GETFONT, 0, 0));
+    RECT tr = rc;
+    tr.left = br.right + MulDiv(4, dpi, 96);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, (st & CDIS_DISABLED) ? ThemeHint() : ThemeText());
+    UINT fmt = DT_SINGLELINE | DT_VCENTER | DT_LEFT | ((st & CDIS_SHOWKEYBOARDCUES) ? 0 : DT_HIDEPREFIX);
+    DrawTextW(dc, text, -1, &tr, fmt);
+    if ((st & CDIS_FOCUS) && (st & CDIS_SHOWKEYBOARDCUES)) {
+        RECT fr = tr;
+        DrawTextW(dc, text, -1, &fr, fmt | DT_CALCRECT);
+        int hgt = fr.bottom - fr.top;
+        fr.top = tr.top + (tr.bottom - tr.top - hgt) / 2;
+        fr.bottom = fr.top + hgt;
+        InflateRect(&fr, 1, 0);
+        DrawFocusRect(dc, &fr);
+    }
+    SelectObject(dc, old);
+    *result = CDRF_SKIPDEFAULT;
+    return TRUE;
+}
+
 static void ApplyListColors(void);
 
 static void ApplyThemeToWindow(HWND h) {
@@ -246,6 +328,10 @@ static void ApplyThemeToWindow(HWND h) {
     else SetWindowTheme(h, g_dark ? L"DarkMode_Explorer" : NULL, NULL);
     if (_wcsicmp(cls, L"Button") == 0 && (GetWindowLongW(h, GWL_STYLE) & BS_TYPEMASK) == BS_GROUPBOX)
         SetWindowSubclass(h, GroupBoxSubclass, 1, 0);
+    if (_wcsicmp(cls, L"Edit") == 0) {
+        SetWindowSubclass(h, EditSubclass, 1, 0);
+        RedrawWindow(h, NULL, NULL, RDW_FRAME | RDW_INVALIDATE);
+    }
 }
 
 static void ApplyThemeToTitleBar(HWND h) {
@@ -283,6 +369,16 @@ static BOOL DialogColor(UINT msg, WPARAM wp, LPARAM lp, INT_PTR *ret) {
     case WM_CTLCOLORDLG:
         *ret = (INT_PTR)g_brFace;
         return TRUE;
+    case WM_NOTIFY: {
+        NMHDR *nh = (NMHDR *)lp;
+        LRESULT r;
+        if (nh->code == NM_CUSTOMDRAW && DrawDarkCheckbox((NMCUSTOMDRAW *)lp, &r)) {
+            SetWindowLongPtrW(GetParent(nh->hwndFrom), DWLP_MSGRESULT, r);
+            *ret = TRUE;
+            return TRUE;
+        }
+        return FALSE;
+    }
     case WM_CTLCOLORBTN:
         SetBkMode(dc, TRANSPARENT);
         SetTextColor(dc, ThemeText());

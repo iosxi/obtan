@@ -12,7 +12,7 @@
 #include <stddef.h>
 
 #define APP_NAME    L"obtan"
-#define APP_VERSION "3"
+#define APP_VERSION "4"
 
 // ---------------------------------------------------------------- util.c
 

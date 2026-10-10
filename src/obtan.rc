@@ -13,7 +13,7 @@ BEGIN
     LTEXT           "URL:", -1, 10, 10, 70, 10
     EDITTEXT        IDC_URL, 82, 8, 214, 13, ES_AUTOHSCROLL
     PUSHBUTTON      "調べる", IDC_PROBE_BTN, 300, 7, 50, 15
-    LTEXT           "GitHub・GitLab・Codeberg のリポジトリ、Firefox アドオン、ダウンロードのリンクがあるページ", IDC_HINT1, 82, 24, 268, 10
+    LTEXT           "GitHub などのリポジトリ、Firefox アドオン、ダウンロードのリンクがあるページ", IDC_HINT1, 82, 24, 268, 10
 
     LTEXT           "名前:", -1, 10, 41, 70, 10
     EDITTEXT        IDC_NAME, 82, 39, 120, 13, ES_AUTOHSCROLL
@@ -74,8 +74,8 @@ BEGIN
 END
 
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION 3,0,0,0
-PRODUCTVERSION 3,0,0,0
+FILEVERSION 4,0,0,0
+PRODUCTVERSION 4,0,0,0
 FILEOS VOS_NT_WINDOWS32
 FILETYPE VFT_APP
 BEGIN
@@ -85,8 +85,8 @@ BEGIN
         BEGIN
             VALUE "FileDescription", "obtan - アプリの新しい版を見張ってダウンロードする"
             VALUE "ProductName", "obtan"
-            VALUE "FileVersion", "3"
-            VALUE "ProductVersion", "3"
+            VALUE "FileVersion", "4"
+            VALUE "ProductVersion", "4"
         END
     END
     BLOCK "VarFileInfo"
