@@ -12,7 +12,7 @@
 #include <stddef.h>
 
 #define APP_NAME    L"obtan"
-#define APP_VERSION "1"
+#define APP_VERSION "2"
 
 // ---------------------------------------------------------------- util.c
 
@@ -93,7 +93,8 @@ int  HttpDownload(const char *url, const WCHAR *path, ProgressFn fn, void *ctx, 
 
 // ---------------------------------------------------------------- source.c（最新版の判定）
 
-typedef enum { SRC_AUTO, SRC_GITHUB, SRC_GITLAB, SRC_GITEA, SRC_WEB, SRC_COUNT } SourceKind;
+// ini には番号で保存するので、新しい取得元は SRC_COUNT の直前に足す
+typedef enum { SRC_AUTO, SRC_GITHUB, SRC_GITLAB, SRC_GITEA, SRC_WEB, SRC_AMO, SRC_COUNT } SourceKind;
 
 typedef struct {
     char *name;      // ファイル名

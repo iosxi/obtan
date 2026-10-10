@@ -15,19 +15,21 @@ Obtainium と同じように GitHub などのリリースを見張れるほか�
 | GitHub | `https://github.com/notepad-plus-plus/notepad-plus-plus` | リリースのタグ名 |
 | GitLab | `https://gitlab.com/グループ/プロジェクト` | リリースのタグ名 |
 | Codeberg / Gitea / Forgejo | `https://codeberg.org/所有者/リポジトリ` | リリースのタグ名 |
+| Firefox アドオン（AMO） | `https://addons.mozilla.org/ja/firefox/addon/ublock-origin/` | AMO で公開中の版 |
 | Web ページ | `https://zoom-pon.qzy.workers.dev/` | リンクのファイル名に含まれる数字 |
 
-取得元は URL から自動で判定する（`github.com`・`gitlab.*`・`codeberg.org` 以外は Web ページ扱い）。登録画面で明示もできる。
+取得元は URL から自動で判定する（`github.com`・`gitlab.*`・`codeberg.org`・`addons.mozilla.org` 以外は Web ページ扱い）。登録画面で明示もできる。
 
 ### どのファイルを落とすか
 
 「ファイル名の条件」（正規表現）が空のときは自動で選ぶ。
 
-- **リリース**: `.exe .msi .msix .appx .zip .7z` のうち、Windows x64 向けらしいもの
+- **リリース**: `.exe .msi .msix .appx .zip .7z .xpi` のうち、Windows x64 向けらしいもの
   （`win` `windows` `x64` `amd64` などを含むものを優先し、`linux` `mac` `arm64` などは避ける。
-  `.exe` > `.msi` > `.zip` の順）。最新のリリースに該当が無ければ、ひとつ前のリリースを見る。
+  `.exe` > `.msi` > `.zip` > `.xpi` の順）。Firefox 拡張を GitHub のリリースで配っているもの（`.xpi`）もこれで選ばれる。最新のリリースに該当が無ければ、ひとつ前のリリースを見る。
   プレリリースは既定では対象外。
-- **Web ページ**: `href` / `src` と本文中の URL のうち、`.exe .msi .msix .appx .zip .7z` で終わるもの。
+- **Firefox アドオン**: AMO が配っている `.xpi`。
+- **Web ページ**: `href` / `src` と本文中の URL のうち、`.exe .msi .msix .appx .zip .7z .xpi` で終わるもの。
   複数あれば版がいちばん新しいもの。
 
 条件を書くときは正規表現で、大文字小文字は区別しない。リリースではファイル名に、Web ページでは URL 全体に当てる。
@@ -73,6 +75,7 @@ Obtainium と同じように GitHub などのリリースを見張れるほか�
   （公開リポジトリだけなら権限は要らない）。トークンは `obtan.ini` に平文で保存される。
 - Web ページは HTML をそのまま読む。JavaScript で後からリンクを作るページでは見つからない。
 - 保存したファイルには「インターネットから入手した」印（Mark of the Web）を付けない。
+- `.xpi` は保存するだけ。Firefox に入れるときは、保存した `.xpi` を Firefox の窓へドラッグする。
 
 ## 設定ファイル
 
@@ -86,7 +89,7 @@ obtan.exe                 一覧を開く
 obtan.exe -tray           トレイにしまった状態で起動する
 obtan.exe -ini <path>     別の ini で起動する（二重起動の制限も外れる）
 
-obtan.exe -probe <url> [-kind github|gitlab|gitea|web] [-filter 正規表現] [-ver 正規表現] [-pre] [-token t] [-dl フォルダ]
+obtan.exe -probe <url> [-kind github|gitlab|gitea|web|amo] [-filter 正規表現] [-ver 正規表現] [-pre] [-token t] [-dl フォルダ]
                           最新の版と落とすファイルを標準出力に出す。-dl を付けるとそこへ保存する
 obtan.exe -selftest       正規表現・版の比較・ファイル選びの自己テスト
 ```

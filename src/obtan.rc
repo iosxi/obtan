@@ -13,7 +13,7 @@ BEGIN
     LTEXT           "URL:", -1, 10, 10, 70, 10
     EDITTEXT        IDC_URL, 82, 8, 214, 13, ES_AUTOHSCROLL
     PUSHBUTTON      "調べる", IDC_PROBE_BTN, 300, 7, 50, 15
-    LTEXT           "GitHub・GitLab・Codeberg のリポジトリか、ダウンロードのリンクがあるページ", IDC_HINT1, 82, 24, 268, 10
+    LTEXT           "GitHub・GitLab・Codeberg のリポジトリ、Firefox アドオン、ダウンロードのリンクがあるページ", IDC_HINT1, 82, 24, 268, 10
 
     LTEXT           "名前:", -1, 10, 41, 70, 10
     EDITTEXT        IDC_NAME, 82, 39, 120, 13, ES_AUTOHSCROLL
@@ -22,7 +22,7 @@ BEGIN
 
     LTEXT           "ファイル名の条件:", -1, 10, 60, 70, 10
     EDITTEXT        IDC_FILTER, 82, 58, 268, 13, ES_AUTOHSCROLL
-    LTEXT           "正規表現（大文字小文字は区別しない）。空欄なら Windows 向けらしいファイルを自動で選ぶ。Web ページでは空欄だと .exe .msi .zip .7z などへのリンクが対象。例: x64.*\\.zip$", IDC_HINT2, 82, 73, 268, 26
+    LTEXT           "正規表現（大文字小文字は区別しない）。空欄なら Windows 向けらしいファイルを自動で選ぶ。Web ページでは空欄だと .exe .msi .zip .xpi などへのリンクが対象。例: x64.*\\.zip$", IDC_HINT2, 82, 73, 268, 26
 
     LTEXT           "版の取り出し:", -1, 10, 104, 70, 10
     EDITTEXT        IDC_VERRX, 82, 102, 268, 13, ES_AUTOHSCROLL
@@ -74,8 +74,8 @@ BEGIN
 END
 
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION 1,0,0,0
-PRODUCTVERSION 1,0,0,0
+FILEVERSION 2,0,0,0
+PRODUCTVERSION 2,0,0,0
 FILEOS VOS_NT_WINDOWS32
 FILETYPE VFT_APP
 BEGIN
@@ -85,8 +85,8 @@ BEGIN
         BEGIN
             VALUE "FileDescription", "obtan - アプリの新しい版を見張ってダウンロードする"
             VALUE "ProductName", "obtan"
-            VALUE "FileVersion", "1"
-            VALUE "ProductVersion", "1"
+            VALUE "FileVersion", "2"
+            VALUE "ProductVersion", "2"
         END
     END
     BLOCK "VarFileInfo"

@@ -1,6 +1,7 @@
 // 取得元ごとに「最新の版」と「ダウンロードするファイル」を決める
 //
 // GitHub / GitLab / Gitea 系（Codeberg・Forgejo）はリリースの API を読む。
+// Firefox アドオン（addons.mozilla.org）は AMO の API で公開中の版と .xpi を引く。
 // Web ページは HTML の href / src と本文中の URL を集め、条件に合うリンクのうち版がいちばん新しいものを選ぶ。
 // リンクから版が読めない（setup.exe のような固定名）ときは、そのファイルの Last-Modified / ETag を版の代わりにする。
 
@@ -11,7 +12,7 @@
 #include <string.h>
 #include <ctype.h>
 
-static const char *DEFAULT_WEB_FILTER = "\\.(exe|msi|msix|msixbundle|appx|appxbundle|zip|7z)$";
+static const char *DEFAULT_WEB_FILTER = "\\.(exe|msi|msix|msixbundle|appx|appxbundle|zip|7z|xpi)$";
 
 const char *SourceName(SourceKind k) {
     switch (k) {
@@ -19,6 +20,7 @@ const char *SourceName(SourceKind k) {
     case SRC_GITLAB: return "GitLab";
     case SRC_GITEA:  return "Codeberg / Gitea / Forgejo";
     case SRC_WEB:    return "Web ページ";
+    case SRC_AMO:    return "Firefox アドオン (AMO)";
     default:         return "自動判定";
     }
 }
@@ -79,6 +81,7 @@ SourceKind SourceDetect(const char *url) {
         else if (strcmp(u.host, "gitlab.com") == 0 || strncmp(u.host, "gitlab.", 7) == 0) k = SRC_GITLAB;
         else if (strcmp(u.host, "codeberg.org") == 0 || strncmp(u.host, "gitea.", 6) == 0 ||
                  strncmp(u.host, "forgejo.", 8) == 0) k = SRC_GITEA;
+        else if (strcmp(u.host, "addons.mozilla.org") == 0) k = SRC_AMO;
     }
     free(u.path);
     return k;
@@ -257,6 +260,7 @@ int WindowsScore(const char *name) {
              strcmp(dot, ".appxbundle") == 0) score += 8;
     else if (strcmp(dot, ".zip") == 0) score += 6;
     else if (strcmp(dot, ".7z") == 0) score += 5;
+    else if (strcmp(dot, ".xpi") == 0) score += 4;   // Firefox 拡張（GitHub のリリースに置かれることが多い）
     else return -1000;   // 自動で選ぶのは Windows で使う形式だけ。ほかは「ファイル名の条件」で指定してもらう
     return score;
 }
@@ -353,7 +357,7 @@ static int ChooseByScore(const Latest *out, const Rules *r) {
 }
 
 static char *HttpErrorText(const HttpResp *r, const char *what) {
-    if (r->status == 404) return U8Fmt("%s が見つからない（HTTP 404）", what);
+    if (r->status == 404) return U8Fmt("%sが見つからない（HTTP 404）", what);
     if ((r->status == 403 || r->status == 429) && r->body.p && U8FindI(r->body.p, "rate limit"))
         return U8Fmt("API の回数制限に達した（HTTP %d）。しばらく待つか、設定で GitHub トークンを指定する", r->status);
     return U8Fmt("%s: HTTP %d", what, r->status);
@@ -785,10 +789,75 @@ static int FromWebPage(const SourceCfg *cfg, Latest *out) {
     return 1;
 }
 
+// ---------------------------------------------------------------- Firefox アドオン（AMO）
+
+// https://addons.mozilla.org/ja/firefox/addon/<slug>/ の <slug>（数字の ID や GUID でもよい）で API を引く
+static int FromAmo(const SourceCfg *cfg, Latest *out) {
+    UrlParts u;
+    if (!SplitUrl(cfg->url, &u)) { SetErr(out, "URL の形式が正しくない", NULL); return 0; }
+    char segs[8][256];
+    int ns = PathSegments(u.path, segs, 8);
+    free(u.path);
+    const char *slug = NULL;
+    for (int i = 0; i + 1 < ns; i++) if (strcmp(segs[i], "addon") == 0) slug = segs[i + 1];
+    if (!slug) { SetErr(out, "URL にアドオンの名前が無い（…/firefox/addon/名前/ の形にする）", NULL); return 0; }
+
+    char *api = U8Fmt("https://addons.mozilla.org/api/v5/addons/addon/%s/?lang=ja", slug);
+    HttpResp r;
+    int ok = HttpGet(api, "Accept: application/json", 0, &r, out->err, sizeof(out->err));
+    free(api);
+    if (!ok) return 0;
+    if (r.status != 200) {
+        char *e = HttpErrorText(&r, "アドオン");
+        SetErr(out, "%s", e);
+        free(e);
+        HttpRespFree(&r);
+        return 0;
+    }
+    J *root = JsonParse(r.body.p);
+    HttpRespFree(&r);
+    J *cv = JsonGet(root, "current_version");
+    const char *ver = JsonStr(cv, "version");
+    const char *url = JsonStr(JsonGet(cv, "file"), "url");
+    if (!ver || !url) {
+        JsonFree(root);
+        SetErr(out, "公開中の版が無い（AMO に載っていないか、取り下げられている）", NULL);
+        return 0;
+    }
+    // 名前は言語ごとの辞書で返る（lang を付けても {"ja": "…"} の形）
+    J *name = JsonGet(root, "name");
+    if (name && name->t == J_OBJ) name = name->child;
+    if (name && name->t == J_STR) out->title = U8Dup(name->s);
+    const char *page = JsonStr(root, "url");
+    out->page = U8Dup(page ? page : cfg->url);
+
+    Rules rules;
+    if (!CompileRules(cfg, &rules, out, NULL)) { JsonFree(root); return 0; }
+    char *fname = LastSegment(url);
+    AddCand(out, fname, url, ver, WindowsScore(fname));
+    free(fname);
+    int pick = ChooseByScore(out, &rules);
+    if (pick < 0 && !rules.filter) pick = 0;   // 条件が無ければ、AMO が出す 1 つをそのまま使う
+    if (pick >= 0) {
+        out->chosen = pick;
+        out->fileUrl = U8Dup(out->cands[pick].url);
+        out->fileName = U8Dup(out->cands[pick].name);
+        out->version = ExtractVersion(rules.verRx, ver);
+        if (!out->version) out->version = U8Dup(ver);
+    } else {
+        SetErr(out, "ファイル名の条件に合わない", NULL);
+    }
+    FreeRules(&rules);
+    JsonFree(root);
+    return pick >= 0;
+}
+
 int SourceLatest(const SourceCfg *cfg, Latest *out) {
     memset(out, 0, sizeof(*out));
     out->chosen = -1;
     out->kind = cfg->kind == SRC_AUTO ? SourceDetect(cfg->url) : cfg->kind;
-    out->ok = out->kind == SRC_WEB ? FromWebPage(cfg, out) : FromReleases(cfg, out);
+    if (out->kind == SRC_WEB) out->ok = FromWebPage(cfg, out);
+    else if (out->kind == SRC_AMO) out->ok = FromAmo(cfg, out);
+    else out->ok = FromReleases(cfg, out);
     return out->ok;
 }

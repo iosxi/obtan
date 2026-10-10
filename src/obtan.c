@@ -1754,6 +1754,7 @@ static int SelfTest(void) {
         { "npp.8.9.8.1.Installer.x64.exe", 1, "npp.8.9.8.1.Installer.arm64.exe" },
         { "npp.8.9.8.1.Installer.x64.exe", 1, "npp.8.9.8.1.Installer.x64.msi" },
         { "app-windows-amd64.zip", 1, "app-linux-amd64.tar.gz" },
+        { "follient-29.0.0-signed.xpi", 1, "follient-29.0.0-signed.xpi.sig" },
     };
     for (size_t i = 0; i < sizeof(st) / sizeof(st[0]); i++) {
         int a = WindowsScore(st[i].name), b = WindowsScore(st[i].than);
@@ -1769,7 +1770,7 @@ static int SelfTest(void) {
     return fail ? 1 : 0;
 }
 
-// -probe <url> [-kind github|gitlab|gitea|web] [-filter re] [-ver re] [-pre] [-token t] [-dl dir]
+// -probe <url> [-kind github|gitlab|gitea|web|amo] [-filter re] [-ver re] [-pre] [-token t] [-dl dir]
 static int Probe(int argc, WCHAR **argv) {
     char *url = NULL, *filter = NULL, *ver = NULL, *token = NULL;
     WCHAR *dl = NULL;
@@ -1788,6 +1789,7 @@ static int Probe(int argc, WCHAR **argv) {
             else if (!_wcsicmp(argv[i], L"gitlab")) kind = SRC_GITLAB;
             else if (!_wcsicmp(argv[i], L"gitea")) kind = SRC_GITEA;
             else if (!_wcsicmp(argv[i], L"web")) kind = SRC_WEB;
+            else if (!_wcsicmp(argv[i], L"amo")) kind = SRC_AMO;
         }
     }
     SourceCfg cfg = { url, kind, filter, ver, pre, token };
