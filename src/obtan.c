@@ -67,6 +67,7 @@ typedef struct {
     int   prerelease;
     WCHAR dest[MAX_PATH];
     int   autodl;
+    int   enabled;           // 一覧のチェック。付いているものだけを「すべて確認」と自動確認の対象にする
     WCHAR installed[128];    // 取得済みの版
     WCHAR latest[128];       // 最後に確認した最新の版
     WCHAR latestName[260];
@@ -79,6 +80,9 @@ typedef struct {
     int   queued;            // 待ち行列にある仕事の種類
     int   busy;              // 実行中の仕事の種類
     int   progress;
+    long long retryAt;       // 回数制限で待っている仕事を再開する時刻（0 なら待っていない）
+    int   retryType;
+    int   retryAuto;
 } App;
 
 typedef struct Job {
@@ -91,6 +95,7 @@ typedef struct Job {
 
 typedef struct {
     int   type, id, automatic, ok;
+    long long deferUntil;    // 回数制限で見送った（この時刻に再開）
     WCHAR err[512];
     WCHAR version[128], fileName[260], page[1024];
     WCHAR path[MAX_PATH];
@@ -445,6 +450,7 @@ static void SaveApp(const App *a) {
     IniPutInt(sec, L"prerelease", a->prerelease);
     IniPut(sec, L"dest", a->dest);
     IniPutInt(sec, L"autodl", a->autodl);
+    IniPutInt(sec, L"enabled", a->enabled);
     IniPut(sec, L"installed", a->installed);
     IniPut(sec, L"latest", a->latest);
     IniPut(sec, L"latestname", a->latestName);
@@ -465,6 +471,7 @@ static void LoadApp(App *a, const WCHAR *sec) {
     a->prerelease = (int)IniGetInt(sec, L"prerelease", 0);
     IniGet(sec, L"dest", a->dest, _countof(a->dest));
     a->autodl = (int)IniGetInt(sec, L"autodl", 0);
+    a->enabled = (int)IniGetInt(sec, L"enabled", 1);
     IniGet(sec, L"installed", a->installed, _countof(a->installed));
     IniGet(sec, L"latest", a->latest, _countof(a->latest));
     IniGet(sec, L"latestname", a->latestName, _countof(a->latestName));
@@ -566,6 +573,15 @@ static char *FormatLatest(const Latest *l, const char *nl) {
         s = U8Fmt("エラー: %s%s", l->err, nl);
         BufAddStr(&b, s);
         free(s);
+        if (l->retryAt) {
+            WCHAR t[32];
+            FormatTime(l->retryAt, t, _countof(t));
+            char *u = W2U(t);
+            s = U8Fmt("回数制限: %s に解除される%s", u, nl);
+            BufAddStr(&b, s);
+            free(s);
+            free(u);
+        }
     }
     if (l->kind == SRC_WEB && l->allLinks) {
         s = U8Fmt("ページ内のリンク %d 件のうち、条件に合うもの %d 件%s", l->allLinks, l->ncand, nl);
@@ -608,15 +624,47 @@ static void OnProgress(void *ctx, long long got, long long total) {
     PostMessageW(g_main, WM_APP_PROGRESS, (WPARAM)p->id, (LPARAM)pct);
 }
 
+// 回数制限に当たったホストと、問い合わせを再開してよい時刻（ワーカースレッドだけが触る）
+static struct { char host[128]; long long until; } g_blocks[16];
+
+static long long BlockedUntil(const char *host) {
+    for (int i = 0; i < 16; i++) if (strcmp(g_blocks[i].host, host) == 0) return g_blocks[i].until;
+    return 0;
+}
+
+static void SetBlocked(const char *host, long long until) {
+    int slot = 0;
+    for (int i = 0; i < 16; i++) {
+        if (strcmp(g_blocks[i].host, host) == 0) { slot = i; break; }
+        if (g_blocks[i].until < g_blocks[slot].until) slot = i;   // 空き（0）か一番古いものを使う
+    }
+    snprintf(g_blocks[slot].host, sizeof(g_blocks[slot].host), "%s", host);
+    g_blocks[slot].until = until;
+}
+
 static JobResult *RunJob(const Job *j) {
     JobResult *r = (JobResult *)calloc(1, sizeof(JobResult));
     if (!r) return NULL;
     r->type = j->type;
     r->id = j->id;
     r->automatic = j->automatic;
+    // 制限に当たっているホストには、解除の時刻まで問い合わせない（残りの登録をまとめてエラーにしないため）
+    char host[128];
+    SourceApiHost(j->url, (SourceKind)j->kind, host, sizeof(host));
+    long long until = BlockedUntil(host);
+    if (until > NowUnix()) {
+        r->deferUntil = until;
+        return r;
+    }
     SourceCfg cfg = { j->url, (SourceKind)j->kind, j->filter, j->verRx, j->prerelease, j->token };
     Latest l;
     SourceLatest(&cfg, &l);
+    if (l.retryAt) {
+        SetBlocked(host, l.retryAt + 5);   // 解除の時刻ちょうどは避けて少し後に
+        r->deferUntil = l.retryAt + 5;
+        LatestFree(&l);
+        return r;
+    }
     r->ok = l.ok;
     if (!l.ok) {
         WCopyU8(r->err, _countof(r->err), l.err);
@@ -733,6 +781,8 @@ static void Enqueue(App *a, int type, int automatic) {
         g_worker = CreateThread(NULL, 4 * 1024 * 1024, WorkerProc, NULL, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
     LeaveCriticalSection(&g_qlock);
     a->queued = type;
+    a->retryAt = 0;
+    a->retryType = a->retryAuto = 0;
     UpdateRow(a);
     UpdateStatusBar();
 }
@@ -764,7 +814,8 @@ static void CheckAll(int automatic) {
     g_lastAuto = NowUnix();
     IniPutInt(L"obtan", L"lastauto", g_lastAuto);
     if (automatic) g_noteUpdates[0] = g_noteDownloads[0] = 0;
-    for (int i = 0; i < g_napps; i++) Enqueue(g_apps[i], JOB_CHECK, automatic);
+    for (int i = 0; i < g_napps; i++)
+        if (g_apps[i]->enabled) Enqueue(g_apps[i], JOB_CHECK, automatic);
 }
 
 // ---------------------------------------------------------------- 一覧（ListView）
@@ -779,6 +830,11 @@ static void StateText(const App *a, WCHAR *out, size_t n) {
         else WCopy(out, n, L"ダウンロード中…");
     } else if (a->busy == JOB_CHECK) WCopy(out, n, L"確認中…");
     else if (a->queued) WCopy(out, n, a->queued == JOB_DOWNLOAD ? L"ダウンロード待ち" : L"確認待ち");
+    else if (a->retryAt) {
+        WCHAR t[32];
+        FormatTime(a->retryAt, t, _countof(t));
+        swprintf_s(out, n, L"回数制限のため待機中（%s に再開）", wcschr(t, L' ') ? wcschr(t, L' ') + 1 : t);
+    }
     else if (a->error[0]) swprintf_s(out, n, L"エラー: %s", a->error);
     else if (!a->latest[0]) WCopy(out, n, L"未確認");
     else if (AppHasUpdate(a)) WCopy(out, n, a->installed[0] ? L"新しい版があります" : L"未取得");
@@ -805,7 +861,10 @@ static void UpdateRow(const App *a) {
     ListView_SetItemText(g_list, i, COL_CHECKED, checked);
 }
 
+static BOOL g_rebuilding;   // 一覧を作り直している間は、チェックの変化を利用者の操作とみなさない
+
 static void RebuildList(void) {
+    g_rebuilding = TRUE;
     SendMessageW(g_list, WM_SETREDRAW, FALSE, 0);
     ListView_DeleteAllItems(g_list);
     for (int i = 0; i < g_napps; i++) {
@@ -814,18 +873,22 @@ static void RebuildList(void) {
         it.pszText = g_apps[i]->name;
         it.lParam = g_apps[i]->id;
         ListView_InsertItem(g_list, &it);
+        ListView_SetCheckState(g_list, i, g_apps[i]->enabled);
         UpdateRow(g_apps[i]);
     }
     SendMessageW(g_list, WM_SETREDRAW, TRUE, 0);
+    g_rebuilding = FALSE;
     InvalidateRect(g_list, NULL, TRUE);
 }
 
 static void UpdateStatusBar(void) {
     if (!g_status) return;
     WCHAR s[512];
-    int updates = 0, errors = 0;
+    int updates = 0, errors = 0, waiting = 0, enabled = 0;
     for (int i = 0; i < g_napps; i++) {
         if (AppHasUpdate(g_apps[i])) updates++;
+        if (g_apps[i]->retryAt) waiting++;
+        if (g_apps[i]->enabled) enabled++;
         if (g_apps[i]->error[0]) errors++;
     }
     if (!g_napps) {
@@ -841,12 +904,20 @@ static void UpdateStatusBar(void) {
         }
         WCHAR parts[128] = L"";
         if (updates) swprintf_s(parts, _countof(parts), L"　新しい版あり %d 件", updates);
+        if (waiting) {
+            WCHAR w[64];
+            swprintf_s(w, _countof(w), L"　回数制限で待機 %d 件", waiting);
+            wcscat_s(parts, _countof(parts), w);
+        }
         if (errors) {
             WCHAR e[64];
             swprintf_s(e, _countof(e), L"　エラー %d 件", errors);
             wcscat_s(parts, _countof(parts), e);
         }
-        swprintf_s(s, _countof(s), L"%d 件%s%s　｜　%s", g_napps, parts, WorkerBusy() ? L"　処理中…" : L"", next);
+        WCHAR count[64];
+        if (enabled == g_napps) swprintf_s(count, _countof(count), L"%d 件", g_napps);
+        else swprintf_s(count, _countof(count), L"%d 件（確認するもの %d 件）", g_napps, enabled);
+        swprintf_s(s, _countof(s), L"%s%s%s　｜　%s", count, parts, WorkerBusy() ? L"　処理中…" : L"", next);
     }
     SetWindowTextW(g_status, s);
 }
@@ -1145,7 +1216,7 @@ static INT_PTR CALLBACK AppDlgProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp) {
 static void EditApp(App *existing) {
     App work = {0};
     if (existing) work = *existing;
-    else work.progress = -1;
+    else { work.progress = -1; work.enabled = 1; }
     if (DialogBoxParamW(g_hinst, MAKEINTRESOURCEW(IDD_APP), g_main, AppDlgProc, (LPARAM)&work) != IDOK) return;
     App *a = existing;
     if (!a) {
@@ -1366,7 +1437,7 @@ static void OnCommand(int id) {
     case ID_GETALL: {
         int count = 0;
         for (int i = 0; i < g_napps; i++)
-            if (AppHasUpdate(g_apps[i]) && !g_apps[i]->error[0]) { Enqueue(g_apps[i], JOB_DOWNLOAD, 0); count++; }
+            if (g_apps[i]->enabled && AppHasUpdate(g_apps[i]) && !g_apps[i]->error[0]) { Enqueue(g_apps[i], JOB_DOWNLOAD, 0); count++; }
         if (!count)
             MessageBoxW(g_main, L"ダウンロードを待っている新しい版はありません。\n（先に「すべて確認」で確かめてください）", APP_NAME, MB_ICONINFORMATION);
         break;
@@ -1411,6 +1482,16 @@ static void OnJobDone(JobResult *r) {
     if (!a) { free(r); return; }
     a->busy = JOB_NONE;
     a->progress = -1;
+    if (r->deferUntil) {
+        // 見送り。前の結果はそのまま残し、時刻が来たらタイマーで同じ仕事をやり直す
+        a->retryAt = r->deferUntil;
+        if (r->type > a->retryType) a->retryType = r->type;
+        a->retryAuto |= r->automatic;
+        UpdateRow(a);
+        UpdateStatusBar();
+        free(r);
+        return;
+    }
     a->checked = NowUnix();
     if (r->ok) {
         WCopy(a->latest, _countof(a->latest), r->version);
@@ -1457,8 +1538,39 @@ static void OnIdle(void) {
     UpdateStatusBar();
 }
 
+static void SetEnabled(App *a, int on) {
+    if (a->enabled == on) return;
+    a->enabled = on;
+    if (!on) a->retryAt = 0;   // 回数制限で待っていた分も取りやめる
+    WCHAR sec[32];
+    swprintf_s(sec, _countof(sec), L"app.%d", a->id);
+    IniPutInt(sec, L"enabled", on);
+    UpdateRow(a);
+    int i = AppIndex(a->id);
+    ListView_RedrawItems(g_list, i, i);
+}
+
 static LRESULT OnListNotify(NMHDR *h) {
     switch (h->code) {
+    case LVN_ITEMCHANGED: {
+        NMLISTVIEW *nm = (NMLISTVIEW *)h;
+        if (g_rebuilding || !(nm->uChanged & LVIF_STATE) || nm->iItem < 0 || nm->iItem >= g_napps) return 0;
+        if (!((nm->uNewState ^ nm->uOldState) & LVIS_STATEIMAGEMASK) || !(nm->uOldState & LVIS_STATEIMAGEMASK)) return 0;
+        int on = ((nm->uNewState & LVIS_STATEIMAGEMASK) >> 12) == 2;
+        SetEnabled(g_apps[nm->iItem], on);
+        // 選んでいる行の中で切り替えたなら、選んでいる行をまとめて揃える
+        if (ListView_GetItemState(g_list, nm->iItem, LVIS_SELECTED) & LVIS_SELECTED) {
+            g_rebuilding = TRUE;
+            for (int i = ListView_GetNextItem(g_list, -1, LVNI_SELECTED); i >= 0; i = ListView_GetNextItem(g_list, i, LVNI_SELECTED)) {
+                if (i == nm->iItem || i >= g_napps) continue;
+                ListView_SetCheckState(g_list, i, on);
+                SetEnabled(g_apps[i], on);
+            }
+            g_rebuilding = FALSE;
+        }
+        UpdateStatusBar();
+        return 0;
+    }
     case NM_DBLCLK:
         if (((NMITEMACTIVATE *)h)->iItem >= 0) OnCommand(ID_EDIT);
         return 0;
@@ -1483,7 +1595,8 @@ static LRESULT OnListNotify(NMHDR *h) {
             int i = (int)cd->nmcd.dwItemSpec;
             if (i >= 0 && i < g_napps) {
                 const App *a = g_apps[i];
-                if (a->error[0] && !a->busy && !a->queued) cd->clrText = ThemeError();
+                if (!a->enabled && !a->busy && !a->queued) cd->clrText = ThemeHint();
+                else if (a->error[0] && !a->busy && !a->queued) cd->clrText = ThemeError();
                 else if (AppHasUpdate(a) || a->busy == JOB_DOWNLOAD) cd->clrText = ThemeAccent();
                 else cd->clrText = ThemeText();
             }
@@ -1510,7 +1623,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_list = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
                                  WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT | LVS_SHOWSELALWAYS,
                                  0, 0, 10, 10, hwnd, (HMENU)ID_LIST, g_hinst, NULL);
-        ListView_SetExtendedListViewStyle(g_list, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP);
+        ListView_SetExtendedListViewStyle(g_list, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP | LVS_EX_CHECKBOXES);
         for (int c = 0; c < COL_COUNT; c++) {
             LVCOLUMNW col = { LVCF_TEXT | LVCF_WIDTH };
             col.pszText = (LPWSTR)g_colName[c];
@@ -1573,6 +1686,15 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if ((HWND)wp == g_list) ShowContextMenu(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
         return 0;
     case WM_TIMER:
+        if (wp == TIMER_AUTO) {
+            long long now = NowUnix();
+            for (int i = 0; i < g_napps; i++) {
+                App *a = g_apps[i];
+                if (!a->retryAt || a->retryAt > now || a->queued || a->busy || !a->enabled) continue;
+                int type = a->retryType ? a->retryType : JOB_CHECK, automatic = a->retryAuto;
+                Enqueue(a, type, automatic);
+            }
+        }
         if (wp == TIMER_AUTO && g_intervalHours > 0 && g_napps &&
             NowUnix() - g_lastAuto >= (long long)g_intervalHours * 3600)
             CheckAll(1);

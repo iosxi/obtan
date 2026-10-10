@@ -15,4 +15,11 @@ zip の展開、インストーラーの実行、常駐アプリの停止・再�
   `PrintWindow` で窓だけを撮る（前面化しない）。PowerShell 5.1 のスクリプトに日本語のウィンドウ名を書くときは
   UTF-8 BOM 付きで保存する（BOM が無いと ANSI として読まれ、`FindWindow` が外れる）。
   撮るときは `SetProcessDPIAware()` を先に呼ぶ（呼ばないと縮めた座標で撮って右下が切れる）。
+- 一覧のチェックボックスを外から切り替えるときは、一覧コントロールに `WM_LBUTTONDOWN` / `WM_LBUTTONUP` を
+  チェックボックスの位置（x=12、y=見出しの高さ＋行の高さ×行番号＋行の高さ/2）へ `PostMessage` する。
+  行を選ぶのはラベル部分（x=80 など）へのクリック、Ctrl 付きは wParam に `MK_CONTROL`。状態は
+  `LVM_GETITEMSTATE` で読める。`LVM_SETITEMSTATE` を他プロセスのメモリに LVITEM を書いて送る方法は、
+  状態が 0 になってチェックボックスが消えた（原因は追っていない）。PowerShell 5.1 の UI オートメーションは
+  Win32 コントロールが Pane にしか見えず使えなかった。
+- 回数制限は GitHub の `/rate_limit` で確かめられる（これは回数に数えられない）。
 - 版を上げるときは `src/obtan.h` の `APP_VERSION` と `src/obtan.rc` の版情報を両方直す。

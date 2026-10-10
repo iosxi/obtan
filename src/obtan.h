@@ -12,7 +12,7 @@
 #include <stddef.h>
 
 #define APP_NAME    L"obtan"
-#define APP_VERSION "2"
+#define APP_VERSION "3"
 
 // ---------------------------------------------------------------- util.c
 
@@ -80,6 +80,9 @@ typedef struct {
     char      lastModified[64];
     char      dispName[260];       // Content-Disposition の filename
     long long length;              // Content-Length（不明なら -1）
+    int       rateRemaining;       // X-RateLimit-Remaining（無ければ -1）
+    long long rateReset;           // X-RateLimit-Reset（UNIX 秒、無ければ 0）
+    int       retryAfter;          // Retry-After（秒、無ければ 0）
 } HttpResp;
 
 typedef void (*ProgressFn)(void *ctx, long long got, long long total);
@@ -125,10 +128,12 @@ typedef struct {
     int        ncand;
     int        chosen;       // cands の何番目を選んだか（-1 なし）
     int        allLinks;     // Web ページで見つかったリンクの総数
+    long long  retryAt;      // 回数制限に当たったとき、問い合わせを再開してよい時刻（UNIX 秒）
 } Latest;
 
 const char *SourceName(SourceKind k);
 SourceKind  SourceDetect(const char *url);
+void        SourceApiHost(const char *url, SourceKind kind, char *out, size_t n);   // 回数制限を数える単位
 int         SourceLatest(const SourceCfg *cfg, Latest *out);
 void        LatestFree(Latest *l);
 

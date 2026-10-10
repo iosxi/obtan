@@ -171,6 +171,15 @@ static void ParseDisposition(const char *cd, char *out, size_t outlen) {
     }
 }
 
+static void QueryCustomU8(HINTERNET req, const WCHAR *name, char *out, size_t outlen) {
+    WCHAR buf[256];
+    DWORD cb = sizeof(buf);
+    out[0] = 0;
+    if (!WinHttpQueryHeaders(req, WINHTTP_QUERY_CUSTOM, name, buf, &cb, WINHTTP_NO_HEADER_INDEX)) return;
+    char *u = W2U(buf);
+    if (u) { snprintf(out, outlen, "%s", u); free(u); }
+}
+
 static void FillRespInfo(HINTERNET req, HttpResp *r) {
     DWORD status = 0, cb = sizeof(status);
     WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX,
@@ -182,6 +191,13 @@ static void FillRespInfo(HINTERNET req, HttpResp *r) {
     char len[64], cd[1024];
     QueryHeaderU8(req, WINHTTP_QUERY_CONTENT_LENGTH, len, sizeof(len));
     r->length = len[0] ? _atoi64(len) : -1;
+    char rl[64];
+    QueryCustomU8(req, L"X-RateLimit-Remaining", rl, sizeof(rl));
+    r->rateRemaining = rl[0] ? atoi(rl) : -1;
+    QueryCustomU8(req, L"X-RateLimit-Reset", rl, sizeof(rl));
+    r->rateReset = rl[0] ? _atoi64(rl) : 0;
+    QueryCustomU8(req, L"Retry-After", rl, sizeof(rl));
+    r->retryAfter = rl[0] ? atoi(rl) : 0;
     QueryHeaderU8(req, WINHTTP_QUERY_CONTENT_DISPOSITION, cd, sizeof(cd));
     ParseDisposition(cd, r->dispName, sizeof(r->dispName));
 

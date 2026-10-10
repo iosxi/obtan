@@ -74,8 +74,8 @@ BEGIN
 END
 
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION 2,0,0,0
-PRODUCTVERSION 2,0,0,0
+FILEVERSION 3,0,0,0
+PRODUCTVERSION 3,0,0,0
 FILEOS VOS_NT_WINDOWS32
 FILETYPE VFT_APP
 BEGIN
@@ -85,8 +85,8 @@ BEGIN
         BEGIN
             VALUE "FileDescription", "obtan - アプリの新しい版を見張ってダウンロードする"
             VALUE "ProductName", "obtan"
-            VALUE "FileVersion", "2"
-            VALUE "ProductVersion", "2"
+            VALUE "FileVersion", "3"
+            VALUE "ProductVersion", "3"
         END
     END
     BLOCK "VarFileInfo"

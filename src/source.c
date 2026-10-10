@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <time.h>
 
 static const char *DEFAULT_WEB_FILTER = "\\.(exe|msi|msix|msixbundle|appx|appxbundle|zip|7z|xpi)$";
 
@@ -68,6 +69,14 @@ static int PathSegments(const char *path, char segs[][256], int max) {
 static void StripGitSuffix(char *s) {
     size_t n = strlen(s);
     if (n > 4 && _stricmp(s + n - 4, ".git") == 0) s[n - 4] = 0;
+}
+
+void SourceApiHost(const char *url, SourceKind kind, char *out, size_t n) {
+    if (kind == SRC_AUTO) kind = SourceDetect(url);
+    if (kind == SRC_GITHUB) { snprintf(out, n, "api.github.com"); return; }
+    UrlParts u;
+    if (SplitUrl(url, &u)) { snprintf(out, n, "%s", u.host); free(u.path); }
+    else snprintf(out, n, "%s", url);
 }
 
 SourceKind SourceDetect(const char *url) {
@@ -356,6 +365,16 @@ static int ChooseByScore(const Latest *out, const Rules *r) {
     return best;
 }
 
+// 回数制限の応答なら、問い合わせを再開してよい時刻を控える
+static void NoteRateLimit(const HttpResp *r, Latest *out) {
+    int limited = r->status == 429 ||
+                  (r->status == 403 && (r->rateRemaining == 0 || (r->body.p && U8FindI(r->body.p, "rate limit"))));
+    if (!limited) return;
+    long long now = (long long)time(NULL);
+    if (r->rateReset > now) out->retryAt = r->rateReset;
+    else out->retryAt = now + (r->retryAfter > 0 ? r->retryAfter : 15 * 60);
+}
+
 static char *HttpErrorText(const HttpResp *r, const char *what) {
     if (r->status == 404) return U8Fmt("%sが見つからない（HTTP 404）", what);
     if ((r->status == 403 || r->status == 429) && r->body.p && U8FindI(r->body.p, "rate limit"))
@@ -433,6 +452,7 @@ static int FromReleases(const SourceCfg *cfg, Latest *out) {
     free(headers);
     if (!ok) return 0;
     if (r.status != 200) {
+        NoteRateLimit(&r, out);
         char *e = HttpErrorText(&r, "リリースの一覧");
         SetErr(out, "%s", e);
         free(e);
@@ -725,6 +745,7 @@ static int FromWebPage(const SourceCfg *cfg, Latest *out) {
     HttpResp r;
     if (!HttpGet(cfg->url, "Accept: text/html,application/xhtml+xml,*/*;q=0.8", 0, &r, out->err, sizeof(out->err))) return 0;
     if (r.status != 200) {
+        NoteRateLimit(&r, out);
         char *e = HttpErrorText(&r, "ページ");
         SetErr(out, "%s", e);
         free(e);
@@ -808,6 +829,7 @@ static int FromAmo(const SourceCfg *cfg, Latest *out) {
     free(api);
     if (!ok) return 0;
     if (r.status != 200) {
+        NoteRateLimit(&r, out);
         char *e = HttpErrorText(&r, "アドオン");
         SetErr(out, "%s", e);
         free(e);
