@@ -19,15 +19,10 @@
 #define IDC_PRE             1007
 #define IDC_DEST            1008
 #define IDC_DEST_BROWSE     1009
-#define IDC_AUTODL          1010
 #define IDC_INSTALLED       1011
 #define IDC_PROBE_OUT       1012
 #define IDC_DEST_HINT       1013
 
 #define IDC_DEFDIR          1101
 #define IDC_DEFDIR_BROWSE   1102
-#define IDC_INTERVAL        1103
-#define IDC_AUTOSTART       1104
-#define IDC_TRAYCLOSE       1105
-#define IDC_NOTIFY          1106
 #define IDC_TOKEN           1107

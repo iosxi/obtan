@@ -2,6 +2,7 @@
 //
 // 取得元は GitHub / GitLab / Codeberg 系のリリースと、任意の Web ページ（ダウンロードのリンクを読む）。
 // 確認とダウンロードは 1 本のワーカースレッドが順番に処理し、結果をメッセージで画面に返す。
+// 常駐はしない。確認もダウンロードも、開いている間に利用者が押したときだけ行う。
 // 設定と一覧は exe の隣の obtan.ini（UTF-16）に置く。展開やインストールはしない（保存まで）。
 
 #include "obtan.h"
@@ -43,16 +44,13 @@
 #define ID_CTX_FOLDER   203
 #define ID_CTX_MARK     204
 #define ID_CTX_UNMARK   205
-#define ID_TRAY_OPEN    300
-#define ID_TRAY_EXIT    301
 
-#define TIMER_AUTO      1
+#define TIMER_RETRY     1   // 回数制限で待っている登録を、解除の時刻が来たらやり直す
 
 #define WM_APP_JOBSTART (WM_APP + 1)   // wParam: id, lParam: 種類
 #define WM_APP_JOBDONE  (WM_APP + 2)   // lParam: JobResult*（受け取り側で free）
 #define WM_APP_PROGRESS (WM_APP + 3)   // wParam: id, lParam: 百分率（-1 は不明）
 #define WM_APP_IDLE     (WM_APP + 4)
-#define WM_APP_TRAY     (WM_APP + 5)
 #define WM_APP_SHOWME   (WM_APP + 6)   // 二重起動されたときに前面へ
 #define WM_APP_PROBED   (WM_APP + 7)   // 登録画面へ: lParam: WCHAR*（free）
 
@@ -67,7 +65,6 @@ typedef struct {
     WCHAR verRx[256];
     int   prerelease;
     WCHAR dest[MAX_PATH];
-    int   autodl;
     int   enabled;           // 一覧のチェック。付いているものだけを「すべて確認」と自動確認の対象にする
     WCHAR installed[128];    // 取得済みの版
     WCHAR latest[128];       // 最後に確認した最新の版
@@ -75,7 +72,6 @@ typedef struct {
     WCHAR page[1024];
     WCHAR file[MAX_PATH];    // 最後に保存したファイル
     WCHAR error[512];
-    WCHAR notified[128];     // 通知済みの版（同じ版を何度も知らせない）
     long long checked;       // 最後に確認した時刻（UNIX 秒）
     // 画面だけの状態
     int   queued;            // 待ち行列にある仕事の種類
@@ -83,12 +79,11 @@ typedef struct {
     int   progress;
     long long retryAt;       // 回数制限で待っている仕事を再開する時刻（0 なら待っていない）
     int   retryType;
-    int   retryAuto;
 } App;
 
 typedef struct Job {
     struct Job *next;
-    int   type, id, automatic;
+    int   type, id;
     int   kind, prerelease;
     char *url, *filter, *verRx, *token;
     WCHAR dest[MAX_PATH];
@@ -98,7 +93,7 @@ typedef struct Job {
 } Job;
 
 typedef struct {
-    int   type, id, automatic, ok;
+    int   type, id, ok;
     long long deferUntil;    // 回数制限で見送った（この時刻に再開）
     int   skipped;           // 取得済みと同じ版だったので落とさなかった
     WCHAR err[512];
@@ -114,27 +109,17 @@ static WCHAR g_exeDir[MAX_PATH], g_ini[MAX_PATH];
 static App **g_apps;
 static int   g_napps;
 static int   g_nextId = 1;
-static UINT  g_taskbarCreated;
-static NOTIFYICONDATAW g_nid;
 static HICON g_iconSmall, g_iconBig;
-static BOOL  g_exiting;
 
 // 設定
 static WCHAR g_defaultDir[MAX_PATH];
-static int   g_intervalHours = 6;
-static BOOL  g_trayOnClose = TRUE;
-static BOOL  g_notify = TRUE;
 static WCHAR g_token[256];
-static long long g_lastAuto;
 
 // 待ち行列とワーカー
 static CRITICAL_SECTION g_qlock;
 static Job   *g_qhead, *g_qtail;
 static HANDLE g_worker;
 static volatile LONG g_cancel;
-
-// 自動確認の結果をまとめて通知するための控え
-static WCHAR g_noteUpdates[512], g_noteDownloads[512];
 
 static int S(int v) { return MulDiv(v, (int)g_dpi, 96); }
 static long long NowUnix(void) { return (long long)time(NULL); }
@@ -549,7 +534,6 @@ static void SaveApp(const App *a) {
     IniPut(sec, L"verrx", a->verRx);
     IniPutInt(sec, L"prerelease", a->prerelease);
     IniPut(sec, L"dest", a->dest);
-    IniPutInt(sec, L"autodl", a->autodl);
     IniPutInt(sec, L"enabled", a->enabled);
     IniPut(sec, L"installed", a->installed);
     IniPut(sec, L"latest", a->latest);
@@ -557,7 +541,6 @@ static void SaveApp(const App *a) {
     IniPut(sec, L"page", a->page);
     IniPut(sec, L"file", a->file);
     IniPut(sec, L"error", a->error);
-    IniPut(sec, L"notified", a->notified);
     IniPutInt(sec, L"checked", a->checked);
 }
 
@@ -570,7 +553,6 @@ static void LoadApp(App *a, const WCHAR *sec) {
     IniGet(sec, L"verrx", a->verRx, _countof(a->verRx));
     a->prerelease = (int)IniGetInt(sec, L"prerelease", 0);
     IniGet(sec, L"dest", a->dest, _countof(a->dest));
-    a->autodl = (int)IniGetInt(sec, L"autodl", 0);
     a->enabled = (int)IniGetInt(sec, L"enabled", 1);
     IniGet(sec, L"installed", a->installed, _countof(a->installed));
     IniGet(sec, L"latest", a->latest, _countof(a->latest));
@@ -578,17 +560,12 @@ static void LoadApp(App *a, const WCHAR *sec) {
     IniGet(sec, L"page", a->page, _countof(a->page));
     IniGet(sec, L"file", a->file, _countof(a->file));
     IniGet(sec, L"error", a->error, _countof(a->error));
-    IniGet(sec, L"notified", a->notified, _countof(a->notified));
     a->checked = IniGetInt(sec, L"checked", 0);
 }
 
 static void SaveSettings(void) {
     IniPut(L"obtan", L"dir", g_defaultDir);
-    IniPutInt(L"obtan", L"interval", g_intervalHours);
-    IniPutInt(L"obtan", L"trayclose", g_trayOnClose);
-    IniPutInt(L"obtan", L"notify", g_notify);
     IniPut(L"obtan", L"token", g_token);
-    IniPutInt(L"obtan", L"lastauto", g_lastAuto);
     IniPutInt(L"obtan", L"nextid", g_nextId);
 }
 
@@ -601,11 +578,7 @@ static void LoadAll(void) {
             CoTaskMemFree(dl);
         }
     }
-    g_intervalHours = (int)IniGetInt(L"obtan", L"interval", 6);
-    g_trayOnClose = (BOOL)IniGetInt(L"obtan", L"trayclose", 1);
-    g_notify = (BOOL)IniGetInt(L"obtan", L"notify", 1);
     IniGet(L"obtan", L"token", g_token, _countof(g_token));
-    g_lastAuto = IniGetInt(L"obtan", L"lastauto", 0);
     g_nextId = (int)IniGetInt(L"obtan", L"nextid", 1);
 
     // [app.N] を書かれた順に読む
@@ -630,27 +603,15 @@ static void LoadAll(void) {
     free(names);
 }
 
-// ---------------------------------------------------------------- Windows の起動時に起動
+// ---------------------------------------------------------------- v5 までの起動時の登録の後片付け
 
-#define RUN_KEY L"Software\\Microsoft\\Windows\\CurrentVersion\\Run"
-
-static BOOL AutostartEnabled(void) {
-    WCHAR v[MAX_PATH * 2];
-    DWORD cb = sizeof(v);
-    return RegGetValueW(HKEY_CURRENT_USER, RUN_KEY, L"obtan", RRF_RT_REG_SZ, NULL, v, &cb) == ERROR_SUCCESS;
-}
-
-static void SetAutostart(BOOL on) {
+// v5 までは「Windows の起動時にトレイで起動する」で HKCU の Run に "obtan" を登録していた。
+// 常駐をやめたので、残っていれば消す（obtan 自身が作った値だけ）。
+static void RemoveOldAutostart(void) {
     HKEY k;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, RUN_KEY, 0, KEY_SET_VALUE, &k) != ERROR_SUCCESS) return;
-    if (on) {
-        WCHAR exe[MAX_PATH], cmd[MAX_PATH * 2 + 32];
-        GetModuleFileNameW(NULL, exe, MAX_PATH);
-        swprintf_s(cmd, _countof(cmd), L"\"%s\" -tray", exe);
-        RegSetValueExW(k, L"obtan", 0, REG_SZ, (const BYTE *)cmd, (DWORD)((wcslen(cmd) + 1) * sizeof(WCHAR)));
-    } else {
-        RegDeleteValueW(k, L"obtan");
-    }
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_QUERY_VALUE | KEY_SET_VALUE, &k) != ERROR_SUCCESS)
+        return;
+    if (RegQueryValueExW(k, L"obtan", NULL, NULL, NULL, NULL) == ERROR_SUCCESS) RegDeleteValueW(k, L"obtan");
     RegCloseKey(k);
 }
 
@@ -747,7 +708,6 @@ static JobResult *RunJob(const Job *j) {
     if (!r) return NULL;
     r->type = j->type;
     r->id = j->id;
-    r->automatic = j->automatic;
     // 制限に当たっているホストには、解除の時刻まで問い合わせない（残りの登録をまとめてエラーにしないため）
     // ダウンロードの前の調べ直しは、GitHub なら API を使わない（API の回数は確認のためだけに使う）
     SourceCfg cfg = { j->url, (SourceKind)j->kind, j->filter, j->verRx, j->prerelease, j->token, j->type == JOB_DOWNLOAD };
@@ -850,7 +810,7 @@ static DWORD WINAPI WorkerProc(void *arg) {
 static void UpdateRow(const App *a);
 static void UpdateStatusBar(void);
 
-static void EnqueueEx(App *a, int type, int automatic, int skipSame) {
+static void EnqueueEx(App *a, int type, int skipSame) {
     // 同じアプリの仕事が待っているなら、ダウンロードの方を優先して 1 つにまとめる
     if (a->queued >= type) return;
     Job *j = (Job *)calloc(1, sizeof(Job));
@@ -860,7 +820,6 @@ static void EnqueueEx(App *a, int type, int automatic, int skipSame) {
     j->installed = W2U(a->installed);
     WCopy(j->file, _countof(j->file), a->file);
     j->id = a->id;
-    j->automatic = automatic;
     j->kind = a->kind;
     j->prerelease = a->prerelease;
     j->url = W2U(a->url);
@@ -893,12 +852,12 @@ static void EnqueueEx(App *a, int type, int automatic, int skipSame) {
     LeaveCriticalSection(&g_qlock);
     a->queued = type;
     a->retryAt = 0;
-    a->retryType = a->retryAuto = 0;
+    a->retryType = 0;
     UpdateRow(a);
     UpdateStatusBar();
 }
 
-static void Enqueue(App *a, int type, int automatic) { EnqueueEx(a, type, automatic, 0); }
+static void Enqueue(App *a, int type) { EnqueueEx(a, type, 0); }
 
 static void DropQueued(int id) {
     EnterCriticalSection(&g_qlock);
@@ -923,12 +882,9 @@ static BOOL WorkerBusy(void) {
     return b;
 }
 
-static void CheckAll(int automatic) {
-    g_lastAuto = NowUnix();
-    IniPutInt(L"obtan", L"lastauto", g_lastAuto);
-    if (automatic) g_noteUpdates[0] = g_noteDownloads[0] = 0;
+static void CheckAll(void) {
     for (int i = 0; i < g_napps; i++)
-        if (g_apps[i]->enabled) Enqueue(g_apps[i], JOB_CHECK, automatic);
+        if (g_apps[i]->enabled) Enqueue(g_apps[i], JOB_CHECK);
 }
 
 // ---------------------------------------------------------------- 一覧（ListView）
@@ -1007,14 +963,6 @@ static void UpdateStatusBar(void) {
     if (!g_napps) {
         WCopy(s, _countof(s), L"「追加」で、見張りたいアプリの URL を登録してください。");
     } else {
-        WCHAR next[64] = L"自動確認はしない";
-        if (g_intervalHours > 0) {
-            WCHAR t[32];
-            long long at = g_lastAuto + (long long)g_intervalHours * 3600;
-            if (at < NowUnix()) at = NowUnix() + 60;
-            FormatTime(at, t, _countof(t));
-            swprintf_s(next, _countof(next), L"次の自動確認 %s", t);
-        }
         WCHAR parts[128] = L"";
         if (updates) swprintf_s(parts, _countof(parts), L"　新しい版あり %d 件", updates);
         if (waiting) {
@@ -1030,7 +978,7 @@ static void UpdateStatusBar(void) {
         WCHAR count[64];
         if (enabled == g_napps) swprintf_s(count, _countof(count), L"%d 件", g_napps);
         else swprintf_s(count, _countof(count), L"%d 件（確認するもの %d 件）", g_napps, enabled);
-        swprintf_s(s, _countof(s), L"%s%s%s　｜　%s", count, parts, WorkerBusy() ? L"　処理中…" : L"", next);
+        swprintf_s(s, _countof(s), L"%s%s%s", count, parts, WorkerBusy() ? L"　処理中…" : L"");
     }
     SetWindowTextW(g_status, s);
 }
@@ -1050,44 +998,9 @@ static App *FocusedApp(void) {
     return i >= 0 && i < g_napps ? g_apps[i] : NULL;
 }
 
-// ---------------------------------------------------------------- 通知とトレイ
-
-static void TrayAdd(void) {
-    g_nid.cbSize = sizeof(g_nid);
-    g_nid.hWnd = g_main;
-    g_nid.uID = 1;
-    g_nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
-    g_nid.uCallbackMessage = WM_APP_TRAY;
-    g_nid.hIcon = g_iconSmall;
-    WCopy(g_nid.szTip, _countof(g_nid.szTip), L"obtan");
-    Shell_NotifyIconW(NIM_ADD, &g_nid);
-    g_nid.uVersion = NOTIFYICON_VERSION_4;
-    Shell_NotifyIconW(NIM_SETVERSION, &g_nid);
-}
-
-static void Notify(const WCHAR *title, const WCHAR *text) {
-    if (!g_notify) return;
-    NOTIFYICONDATAW n = g_nid;
-    n.uFlags = NIF_INFO;
-    n.dwInfoFlags = NIIF_INFO;
-    WCopy(n.szInfoTitle, _countof(n.szInfoTitle), title);
-    WCopy(n.szInfo, _countof(n.szInfo), text);
-    Shell_NotifyIconW(NIM_MODIFY, &n);
-}
-
-static void AppendNote(WCHAR *buf, size_t n, const WCHAR *item) {
-    if (buf[0]) wcscat_s(buf, n, L"、");
-    if (wcslen(buf) + wcslen(item) + 2 < n) wcscat_s(buf, n, item);
-}
-
 static void ShowMain(void) {
     ShowWindow(g_main, IsIconic(g_main) ? SW_RESTORE : SW_SHOW);
     SetForegroundWindow(g_main);
-}
-
-static void ExitApp(void) {
-    g_exiting = TRUE;
-    DestroyWindow(g_main);
 }
 
 // ---------------------------------------------------------------- フォルダ選択
@@ -1207,7 +1120,6 @@ static INT_PTR CALLBACK AppDlgProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp) {
         SetDlgItemTextW(dlg, IDC_VERRX, a->verRx);
         CheckDlgButton(dlg, IDC_PRE, a->prerelease ? BST_CHECKED : BST_UNCHECKED);
         SetDlgItemTextW(dlg, IDC_DEST, a->dest);
-        CheckDlgButton(dlg, IDC_AUTODL, a->autodl ? BST_CHECKED : BST_UNCHECKED);
         SetDlgItemTextW(dlg, IDC_INSTALLED, a->installed);
         SetDlgItemTextW(dlg, IDC_PROBE_OUT, L"「調べる」を押すと、今の設定で最新の版とダウンロードするファイルを確かめます。");
         UpdateDestHint(dlg);
@@ -1305,7 +1217,6 @@ static INT_PTR CALLBACK AppDlgProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp) {
             GetDlgText(dlg, IDC_VERRX, n.verRx, _countof(n.verRx));
             n.prerelease = IsDlgButtonChecked(dlg, IDC_PRE) == BST_CHECKED;
             GetDlgText(dlg, IDC_DEST, n.dest, _countof(n.dest));
-            n.autodl = IsDlgButtonChecked(dlg, IDC_AUTODL) == BST_CHECKED;
             GetDlgText(dlg, IDC_INSTALLED, n.installed, _countof(n.installed));
             // 判定に関わる設定が変わったら、前の確認結果は捨てる
             if (wcscmp(n.url, a->url) || n.kind != a->kind || wcscmp(n.filter, a->filter) ||
@@ -1352,7 +1263,7 @@ static void EditApp(App *existing) {
     ListView_SetItemState(g_list, -1, 0, LVIS_SELECTED);
     ListView_SetItemState(g_list, idx, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
     ListView_EnsureVisible(g_list, idx, FALSE);
-    if (!a->latest[0]) Enqueue(a, JOB_CHECK, 0);
+    if (!a->latest[0]) Enqueue(a, JOB_CHECK);
     UpdateStatusBar();
 }
 
@@ -1388,10 +1299,6 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp
     case WM_INITDIALOG:
         g_dialog = dlg;
         SetDlgItemTextW(dlg, IDC_DEFDIR, g_defaultDir);
-        SetDlgItemInt(dlg, IDC_INTERVAL, (UINT)g_intervalHours, FALSE);
-        CheckDlgButton(dlg, IDC_AUTOSTART, AutostartEnabled() ? BST_CHECKED : BST_UNCHECKED);
-        CheckDlgButton(dlg, IDC_TRAYCLOSE, g_trayOnClose ? BST_CHECKED : BST_UNCHECKED);
-        CheckDlgButton(dlg, IDC_NOTIFY, g_notify ? BST_CHECKED : BST_UNCHECKED);
         SetDlgItemTextW(dlg, IDC_TOKEN, g_token);
         ApplyThemeTree(dlg);
         return TRUE;
@@ -1417,12 +1324,7 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp
                 return TRUE;
             }
             WCopy(g_defaultDir, _countof(g_defaultDir), dir);
-            g_intervalHours = (int)GetDlgItemInt(dlg, IDC_INTERVAL, NULL, FALSE);
-            g_trayOnClose = IsDlgButtonChecked(dlg, IDC_TRAYCLOSE) == BST_CHECKED;
-            g_notify = IsDlgButtonChecked(dlg, IDC_NOTIFY) == BST_CHECKED;
             GetDlgText(dlg, IDC_TOKEN, g_token, _countof(g_token));
-            BOOL autostart = IsDlgButtonChecked(dlg, IDC_AUTOSTART) == BST_CHECKED;
-            if (autostart != AutostartEnabled()) SetAutostart(autostart);
             SaveSettings();
             EndDialog(dlg, IDOK);
             return TRUE;
@@ -1546,13 +1448,13 @@ static void OnCommand(int id) {
     case ID_ADD: EditApp(NULL); break;
     case ID_EDIT: { App *a = FocusedApp(); if (a) EditApp(a); break; }
     case ID_DELETE: DeleteSelected(); break;
-    case ID_CHECKALL: CheckAll(0); break;
+    case ID_CHECKALL: CheckAll(); break;
     case ID_GETALL: {
         // チェックの付いたものを、確認なしでまとめて落とす。GitHub は API を使わずに調べるので回数を減らさない。
         // 取得済みと同じ版でファイルも残っているものは落とさない
         int count = 0;
         for (int i = 0; i < g_napps; i++)
-            if (g_apps[i]->enabled) { EnqueueEx(g_apps[i], JOB_DOWNLOAD, 0, 1); count++; }
+            if (g_apps[i]->enabled) { EnqueueEx(g_apps[i], JOB_DOWNLOAD, 1); count++; }
         if (!count)
             MessageBoxW(g_main, L"チェックの付いた登録がありません。", APP_NAME, MB_ICONINFORMATION);
         break;
@@ -1563,11 +1465,11 @@ static void OnCommand(int id) {
         break;
     case ID_CTX_DOWNLOAD:
         n = SelectedIds(ids, 512);
-        for (int k = 0; k < n; k++) Enqueue(FindApp(ids[k]), JOB_DOWNLOAD, 0);
+        for (int k = 0; k < n; k++) Enqueue(FindApp(ids[k]), JOB_DOWNLOAD);
         break;
     case ID_CTX_CHECK:
         n = SelectedIds(ids, 512);
-        for (int k = 0; k < n; k++) Enqueue(FindApp(ids[k]), JOB_CHECK, 0);
+        for (int k = 0; k < n; k++) Enqueue(FindApp(ids[k]), JOB_CHECK);
         break;
     case ID_CTX_PAGE: {
         App *a = FocusedApp();
@@ -1587,8 +1489,6 @@ static void OnCommand(int id) {
         }
         UpdateStatusBar();
         break;
-    case ID_TRAY_OPEN: ShowMain(); break;
-    case ID_TRAY_EXIT: ExitApp(); break;
     }
 }
 
@@ -1601,7 +1501,6 @@ static void OnJobDone(JobResult *r) {
         // 見送り。前の結果はそのまま残し、時刻が来たらタイマーで同じ仕事をやり直す
         a->retryAt = r->deferUntil;
         if (r->type > a->retryType) a->retryType = r->type;
-        a->retryAuto |= r->automatic;
         UpdateRow(a);
         UpdateStatusBar();
         free(r);
@@ -1619,21 +1518,6 @@ static void OnJobDone(JobResult *r) {
     if (r->type == JOB_DOWNLOAD && r->ok && !r->skipped) {
         WCopy(a->installed, _countof(a->installed), r->version);
         WCopy(a->file, _countof(a->file), r->path);
-        if (r->automatic) {
-            WCHAR item[200];
-            swprintf_s(item, _countof(item), L"%s %s", a->name, a->installed);
-            AppendNote(g_noteDownloads, _countof(g_noteDownloads), item);
-        }
-    }
-    if (r->type == JOB_CHECK && r->ok && AppHasUpdate(a)) {
-        if (a->autodl && r->automatic) {
-            Enqueue(a, JOB_DOWNLOAD, 1);
-        } else if (r->automatic && wcscmp(a->notified, a->latest) != 0) {
-            WCHAR item[200];
-            swprintf_s(item, _countof(item), L"%s %s", a->name, a->latest);
-            AppendNote(g_noteUpdates, _countof(g_noteUpdates), item);
-            WCopy(a->notified, _countof(a->notified), a->latest);
-        }
     }
     SaveApp(a);
     UpdateRow(a);
@@ -1642,14 +1526,6 @@ static void OnJobDone(JobResult *r) {
 }
 
 static void OnIdle(void) {
-    if (g_noteDownloads[0]) {
-        WCHAR t[600];
-        swprintf_s(t, _countof(t), L"%s", g_noteDownloads);
-        Notify(L"ダウンロードしました", t);
-    } else if (g_noteUpdates[0]) {
-        Notify(L"新しい版があります", g_noteUpdates);
-    }
-    g_noteDownloads[0] = g_noteUpdates[0] = 0;
     UpdateStatusBar();
 }
 
@@ -1724,7 +1600,6 @@ static LRESULT OnListNotify(NMHDR *h) {
 }
 
 static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    if (msg == g_taskbarCreated && msg) { TrayAdd(); return 0; }
     switch (msg) {
     case WM_CREATE: {
         g_main = hwnd;
@@ -1753,8 +1628,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         RebuildList();
         LayoutMain();
         UpdateStatusBar();
-        TrayAdd();
-        SetTimer(hwnd, TIMER_AUTO, 60 * 1000, NULL);
+        SetTimer(hwnd, TIMER_RETRY, 60 * 1000, NULL);
         return 0;
     }
     case WM_ERASEBKGND: {
@@ -1801,18 +1675,14 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if ((HWND)wp == g_list) ShowContextMenu(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
         return 0;
     case WM_TIMER:
-        if (wp == TIMER_AUTO) {
+        if (wp == TIMER_RETRY) {
             long long now = NowUnix();
             for (int i = 0; i < g_napps; i++) {
                 App *a = g_apps[i];
                 if (!a->retryAt || a->retryAt > now || a->queued || a->busy || !a->enabled) continue;
-                int type = a->retryType ? a->retryType : JOB_CHECK, automatic = a->retryAuto;
-                Enqueue(a, type, automatic);
+                Enqueue(a, a->retryType ? a->retryType : JOB_CHECK);
             }
         }
-        if (wp == TIMER_AUTO && g_intervalHours > 0 && g_napps &&
-            NowUnix() - g_lastAuto >= (long long)g_intervalHours * 3600)
-            CheckAll(1);
         return 0;
     case WM_APP_JOBSTART: {
         App *a = FindApp((int)wp);
@@ -1842,35 +1712,8 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_APP_SHOWME:
         ShowMain();
         return 0;
-    case WM_APP_TRAY:
-        switch (LOWORD(lp)) {
-        case WM_LBUTTONUP:
-        case NIN_BALLOONUSERCLICK:
-            ShowMain();
-            break;
-        case WM_CONTEXTMENU: {
-            HMENU m = CreatePopupMenu();
-            AppendMenuW(m, MF_STRING, ID_TRAY_OPEN, L"開く");
-            AppendMenuW(m, MF_STRING, ID_CHECKALL, L"すべて確認");
-            AppendMenuW(m, MF_SEPARATOR, 0, NULL);
-            AppendMenuW(m, MF_STRING, ID_TRAY_EXIT, L"終了");
-            SetMenuDefaultItem(m, ID_TRAY_OPEN, FALSE);
-            SetForegroundWindow(hwnd);
-            TrackPopupMenu(m, TPM_RIGHTBUTTON, GET_X_LPARAM(wp), GET_Y_LPARAM(wp), 0, hwnd, NULL);
-            DestroyMenu(m);
-            break;
-        }
-        }
-        return 0;
-    case WM_CLOSE:
-        if (g_trayOnClose && !g_exiting) {
-            ShowWindow(hwnd, SW_HIDE);
-            return 0;
-        }
-        ExitApp();
-        return 0;
     case WM_ENDSESSION:
-        if (wp) { g_exiting = TRUE; DestroyWindow(hwnd); }
+        if (wp) DestroyWindow(hwnd);
         return 0;
     case WM_DESTROY: {
         WINDOWPLACEMENT wpl = { sizeof(wpl) };
@@ -1881,8 +1724,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             IniPutInt(L"obtan", L"w", r->right - r->left);
             IniPutInt(L"obtan", L"h", r->bottom - r->top);
         }
-        Shell_NotifyIconW(NIM_DELETE, &g_nid);
-        KillTimer(hwnd, TIMER_AUTO);
+        KillTimer(hwnd, TIMER_RETRY);
         PostQuitMessage(0);
         return 0;
     }
@@ -2077,11 +1919,9 @@ int WINAPI wWinMain(HINSTANCE hinst, HINSTANCE prev, PWSTR cmd, int show) {
     g_hinst = hinst;
     int argc = 0;
     WCHAR **argv = CommandLineToArgvW(GetCommandLineW(), &argc);
-    BOOL tray = FALSE;
     const WCHAR *iniOverride = NULL;
     for (int i = 1; i < argc; i++) {
-        if (!_wcsicmp(argv[i], L"-tray")) tray = TRUE;
-        else if (!_wcsicmp(argv[i], L"-ini") && i + 1 < argc) iniOverride = argv[++i];
+        if (!_wcsicmp(argv[i], L"-ini") && i + 1 < argc) iniOverride = argv[++i];
         else if (!_wcsicmp(argv[i], L"-selftest")) { OutInit(); return SelfTest(); }
         else if (!_wcsicmp(argv[i], L"-probe")) { OutInit(); NetInit(); return Probe(argc, argv); }
     }
@@ -2110,7 +1950,7 @@ int WINAPI wWinMain(HINSTANCE hinst, HINSTANCE prev, PWSTR cmd, int show) {
     NetInit();
     InitPaths(iniOverride);
     LoadAll();
-    g_taskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
+    if (!iniOverride) RemoveOldAutostart();
 
     LoadIconMetric(hinst, MAKEINTRESOURCEW(IDI_APP), LIM_SMALL, &g_iconSmall);
     LoadIconMetric(hinst, MAKEINTRESOURCEW(IDI_APP), LIM_LARGE, &g_iconBig);
@@ -2141,10 +1981,8 @@ int WINAPI wWinMain(HINSTANCE hinst, HINSTANCE prev, PWSTR cmd, int show) {
     HWND hwnd = CreateWindowExW(0, L"ObtanMain", title, WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
                                 x, y, w, h, NULL, NULL, hinst, NULL);
     if (!hwnd) return 1;
-    if (!tray) {
-        ShowWindow(hwnd, show);
-        UpdateWindow(hwnd);
-    }
+    ShowWindow(hwnd, show);
+    UpdateWindow(hwnd);
 
     MSG m;
     while (GetMessageW(&m, NULL, 0, 0) > 0) {
