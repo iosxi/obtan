@@ -25,4 +25,14 @@ zip の展開、インストーラーの実行、常駐アプリの停止・再�
   状態が 0 になってチェックボックスが消えた（原因は追っていない）。PowerShell 5.1 の UI オートメーションは
   Win32 コントロールが Pane にしか見えず使えなかった。
 - 回数制限は GitHub の `/rate_limit` で確かめられる（これは回数に数えられない）。
+- リリースノートと README の取得は `obtan.exe -notes <url> [-tag t] | cat`、`obtan.exe -readme <url> | cat` で確かめられる。
+
+## GitHub のノートと README の取り方（2026-10-13 に実測）
+
+- `/releases.atom`・リポジトリのトップ・`/releases/expanded_assets/<タグ>` は API の残り回数を減らさない（56 → 56）。
+- Atom に載るのは最新 10 件（プレリリースも含む）。`<content type="html">` は実体参照で包んだ HTML。
+- `/releases/tag/<タグ>` の画面は本文を React の埋め込みデータで持ち、`markdown-body` が HTML に無い。古いタグは API（1 回）に頼る。
+- リポジトリのトップは README を `<article class="markdown-body entry-content container-lg">` に描いている（入れ子の article は無い）。
+- `expanded_assets` の `<relative-time datetime>` は添付の登録日時。最大値は API の `published_at` と数秒の差（v31: 11:37:24 と 11:37:26）。
+- AMO の `release_notes` は版ごとの `/versions/<版>/` にあり、書かれていない版は null（uBlock Origin 1.75.0）。
 - 版を上げるときは `src/obtan.h` の `APP_VERSION` と `src/obtan.rc` の版情報を両方直す。

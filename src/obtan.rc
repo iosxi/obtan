@@ -64,9 +64,20 @@ BEGIN
     PUSHBUTTON      "キャンセル", IDCANCEL, 236, 103, 54, 15
 END
 
+IDD_NOTES DIALOGEX 0, 0, 380, 300
+STYLE DS_SHELLFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MAXIMIZEBOX
+CAPTION "リリースノート"
+FONT 9, "Yu Gothic UI", 400, 0, 0x80
+BEGIN
+    LTEXT           "", IDC_NOTES_HEAD, 7, 7, 366, 10, SS_ENDELLIPSIS | SS_NOPREFIX
+    EDITTEXT        IDC_NOTES_TEXT, 7, 21, 366, 251, ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL
+    PUSHBUTTON      "ブラウザで開く", IDC_NOTES_OPEN, 7, 278, 70, 15
+    DEFPUSHBUTTON   "閉じる", IDCANCEL, 319, 278, 54, 15
+END
+
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION 6,0,0,0
-PRODUCTVERSION 6,0,0,0
+FILEVERSION 7,0,0,0
+PRODUCTVERSION 7,0,0,0
 FILEOS VOS_NT_WINDOWS32
 FILETYPE VFT_APP
 BEGIN
@@ -76,8 +87,8 @@ BEGIN
         BEGIN
             VALUE "FileDescription", "obtan - アプリの新しい版を見張ってダウンロードする"
             VALUE "ProductName", "obtan"
-            VALUE "FileVersion", "6"
-            VALUE "ProductVersion", "6"
+            VALUE "FileVersion", "7"
+            VALUE "ProductVersion", "7"
         END
     END
     BLOCK "VarFileInfo"

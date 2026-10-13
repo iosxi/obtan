@@ -64,6 +64,11 @@ Obtainium と同じように GitHub などのリリースを見張れるほか�
   複数行を選んでいるときにその中の 1 つのチェックを切り替えると、選んでいる行がまとめて揃う。
   チェックを外した行は灰色で表示する。
 
+- 右クリックの「ページを開く」は、登録した URL をそのままブラウザで開く。
+- 「公開日」の列（最新のリリースが公開された日）を押すと、そのリリースの**リリースノート**を読める（Obtainium と同じ）。
+  右クリックの「リリースノートを読む」でも同じ。「README を読む」ではリポジトリの README を読める
+  （Firefox アドオンは「説明を読む」で AMO の説明文）。どちらも画面の中で読み、「ブラウザで開く」で
+  リリースのページ・リポジトリのトップを開ける。Web ページの登録には無い。
 - 保存先は、登録ごとの「保存先フォルダ」。空なら `既定の保存先\名前\`（既定の保存先は「設定」で変える。
   初期値は `ダウンロード\obtan`）。`%USERPROFILE%` のような環境変数も使える。
 - 同じ名前のファイルがあれば上書きする。古い版のファイルは消さない。
@@ -85,6 +90,10 @@ Obtainium と同じように GitHub などのリリースを見張れるほか�
   （`/releases/latest` の転送先と `/releases/expanded_assets/<タグ>`）で行う。ファイルそのもののダウンロードも
   回数に数えられない。回数を使うのは「確認」（1 件 1 回）だけ。ただし「プレリリースも対象にする」にした登録は、
   `/releases/latest` がプレリリースを含まないので、ダウンロードでも API を 1 回使う。
+- **リリースノートと README を読むのも API の回数を使わない。** GitHub のリリースノートは `/releases.atom`
+  （最新 10 件）、README はリポジトリのトップの画面から読む。それより古いリリースのノートを読むときだけ API を 1 回使う。
+  GitHub の README は画面に描かれたものを文字にしているので、画像は出ない。GitLab・Codeberg の README とリリースノートは
+  Markdown のまま出る。
 - 前回から変わっていなければ回数に数えられない、という問い合わせ方（ETag / If-None-Match）は、トークン無しでは
   304 が返っても 1 回に数えられた（2026-10-10 に実測）ので使っていない。
 - Web ページは HTML をそのまま読む。JavaScript で後からリンクを作るページでは見つからない。
@@ -105,10 +114,14 @@ obtan.exe -ini <path>     別の ini で起動する（二重起動の制限も�
 obtan.exe -probe <url> [-kind github|gitlab|gitea|web|amo] [-filter 正規表現] [-ver 正規表現] [-pre] [-noapi] [-token t] [-dl フォルダ]
                           最新の版と落とすファイルを標準出力に出す。-dl を付けるとそこへ保存する
                           -noapi を付けると GitHub を API ではなく普通のページで調べる（ダウンロードと同じ方法）
+obtan.exe -notes <url> [-tag タグ] [-kind ...] [-pre] [-token t]
+                          リリースノートを標準出力に出す（-tag が無ければ最新）
+obtan.exe -readme <url> [-kind ...]
+                          README（AMO はアドオンの説明）を標準出力に出す
 obtan.exe -selftest       正規表現・版の比較・ファイル選びの自己テスト
 ```
 
-`-probe` と `-selftest` は GUI の exe なので、PowerShell からは `| Out-String`、Git Bash からは `| cat` のように
+`-probe`・`-notes`・`-readme`・`-selftest` は GUI の exe なので、PowerShell からは `| Out-String`、Git Bash からは `| cat` のように
 パイプでつなぐと終わりまで待って出力を受け取れる。
 
 ## ビルド

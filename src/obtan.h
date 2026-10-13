@@ -12,7 +12,7 @@
 #include <stddef.h>
 
 #define APP_NAME    L"obtan"
-#define APP_VERSION "6"
+#define APP_VERSION "7"
 
 // ---------------------------------------------------------------- util.c
 
@@ -125,6 +125,8 @@ typedef struct {
     char      *fileName;
     char      *title;        // 名前の候補（リポジトリ名やページの <title>）
     char      *page;         // リリースのページ
+    char      *tag;          // リリースのタグ名（AMO は公開中の版）。リリースノートを引くのに使う
+    long long  published;    // リリースの公開日時（UNIX 秒、不明なら 0）
     Cand      *cands;        // 選んだリリース（ページ）のファイル一覧
     int        ncand;
     int        chosen;       // cands の何番目を選んだか（-1 なし）
@@ -137,6 +139,22 @@ SourceKind  SourceDetect(const char *url);
 void        SourceApiHost(const SourceCfg *cfg, char *out, size_t n);   // 回数制限を数える単位
 int         SourceLatest(const SourceCfg *cfg, Latest *out);
 void        LatestFree(Latest *l);
+
+// リリースノートと README（読むためのダイアログ用）。本文は改行 \n のテキスト
+typedef struct {
+    int       ok;
+    char      err[512];
+    char     *title;         // 見出し（リリースの名前など）
+    char     *text;          // 本文
+    char     *page;          // 「ブラウザで開く」で開くページ
+    long long published;     // リリースの公開日時（分かれば）
+} Notes;
+
+int  SourceHasNotes(const SourceCfg *cfg);                              // Web ページには無い
+int  SourceReleaseNotes(const SourceCfg *cfg, const char *tag, Notes *out);   // tag が空なら最新
+int  SourceReadme(const SourceCfg *cfg, Notes *out);                    // AMO はアドオンの説明
+void NotesFree(Notes *n);
+char *HtmlToText(const char *html, int keepNewlines);
 
 int  VersionIsNewer(const char *latest, const char *installed);   // 更新扱いにするか
 int  VersionCompare(const char *a, const char *b);                // 主要な数字部分の比較

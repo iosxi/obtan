@@ -314,6 +314,7 @@ void LatestFree(Latest *l) {
     free(l->fileName);
     free(l->title);
     free(l->page);
+    free(l->tag);
     memset(l, 0, sizeof(*l));
     l->chosen = -1;
 }
@@ -379,6 +380,27 @@ static void NoteRateLimit(const HttpResp *r, Latest *out) {
     else out->retryAt = now + (r->retryAfter > 0 ? r->retryAfter : 15 * 60);
 }
 
+// 2026-10-12T11:37:26Z / 2026-10-12T15:18:55+02:00 / 2024-10-12T22:00:00.000Z を UNIX 秒に。読めなければ 0
+static long long ParseIsoTime(const char *s) {
+    struct tm t = {0};
+    int y, mo, d, h = 0, mi = 0, sec = 0, used = 0;
+    if (!s || sscanf_s(s, "%d-%d-%dT%d:%d:%d%n", &y, &mo, &d, &h, &mi, &sec, &used) < 3) return 0;
+    t.tm_year = y - 1900;
+    t.tm_mon = mo - 1;
+    t.tm_mday = d;
+    t.tm_hour = h;
+    t.tm_min = mi;
+    t.tm_sec = sec;
+    long long v = (long long)_mkgmtime64(&t);
+    if (v < 0) return 0;
+    const char *p = used ? s + used : "";
+    if (*p == '.') { p++; while (IsDigit((unsigned char)*p)) p++; }
+    int oh, om;
+    if ((*p == '+' || *p == '-') && sscanf_s(p + 1, "%d:%d", &oh, &om) == 2)
+        v -= (*p == '+' ? 1 : -1) * (oh * 3600LL + om * 60LL);
+    return v;
+}
+
 static char *HttpErrorText(const HttpResp *r, const char *what) {
     if (r->status == 404) return U8Fmt("%sが見つからない（HTTP 404）", what);
     if ((r->status == 403 || r->status == 429) && r->body.p && U8FindI(r->body.p, "rate limit"))
@@ -387,6 +409,12 @@ static char *HttpErrorText(const HttpResp *r, const char *what) {
 }
 
 // ---------------------------------------------------------------- リリース API（GitHub / GitLab / Gitea）
+
+static char *GitHubApiHeaders(const SourceCfg *cfg) {
+    return U8Fmt("Accept: application/vnd.github+json\r\nX-GitHub-Api-Version: 2022-11-28%s%s",
+                 cfg->token && *cfg->token ? "\r\nAuthorization: Bearer " : "",
+                 cfg->token && *cfg->token ? cfg->token : "");
+}
 
 // リリース 1 件分のファイルを候補に並べる
 static void FillReleaseCands(Latest *out, const J *rel) {
@@ -425,9 +453,7 @@ static int FromReleases(const SourceCfg *cfg, Latest *out) {
     if (out->kind == SRC_GITHUB) {
         StripGitSuffix(segs[1]);
         api = U8Fmt("https://api.github.com/repos/%s/%s/releases?per_page=30", segs[0], segs[1]);
-        headers = U8Fmt("Accept: application/vnd.github+json\r\nX-GitHub-Api-Version: 2022-11-28%s%s",
-                        cfg->token && *cfg->token ? "\r\nAuthorization: Bearer " : "",
-                        cfg->token && *cfg->token ? cfg->token : "");
+        headers = GitHubApiHeaders(cfg);
         out->title = U8Dup(segs[1]);
     } else if (out->kind == SRC_GITLAB) {
         // グループは入れ子にできる。/-/ より前がプロジェクトのパス
@@ -495,6 +521,8 @@ static int FromReleases(const SourceCfg *cfg, Latest *out) {
         out->version = ExtractVersion(rules.verRx, tag);
         if (!out->version && rules.verRx) out->version = ExtractVersion(rules.verRx, out->fileName);
         if (!out->version) out->version = U8Dup(tag);
+        out->tag = U8Dup(tag);
+        out->published = ParseIsoTime(JsonStr(rel, out->kind == SRC_GITLAB ? "released_at" : "published_at"));
         const char *html = JsonStr(rel, "html_url");
         J *l = JsonGet(rel, "_links");
         if (!html && l) html = JsonStr(l, "self");
@@ -865,6 +893,11 @@ static int FromGitHubWeb(const SourceCfg *cfg, Latest *out) {
         free(tag);
         return 0;
     }
+    // 公開日の代わりに、添付の中でいちばん新しい日時を採る（ページに公開日は無い。日付の単位ならほぼ一致する）
+    for (const char *p = r.body.p; (p = strstr(p, "<relative-time datetime=\"")) != NULL; p++) {
+        long long when = ParseIsoTime(p + 25);
+        if (when > out->published) out->published = when;
+    }
     // 添付ファイルは /所有者/名前/releases/download/<タグ>/<ファイル名> へのリンクとして並んでいる
     StrList links = {0};
     for (const char *p = r.body.p; (p = strstr(p, "href=\"")) != NULL;) {
@@ -893,6 +926,7 @@ static int FromGitHubWeb(const SourceCfg *cfg, Latest *out) {
         out->version = ExtractVersion(rules.verRx, tag);
         if (!out->version && rules.verRx) out->version = ExtractVersion(rules.verRx, out->fileName);
         if (!out->version) out->version = U8Dup(tag);
+        out->tag = U8Dup(tag);
     } else {
         snprintf(out->err, sizeof(out->err), "条件に合うファイルが無い（最新 %s、添付 %d 件）", tag, out->ncand);
     }
@@ -957,6 +991,8 @@ static int FromAmo(const SourceCfg *cfg, Latest *out) {
         out->fileName = U8Dup(out->cands[pick].name);
         out->version = ExtractVersion(rules.verRx, ver);
         if (!out->version) out->version = U8Dup(ver);
+        out->tag = U8Dup(ver);
+        out->published = ParseIsoTime(JsonStr(JsonGet(cv, "file"), "created"));
     } else {
         SetErr(out, "ファイル名の条件に合わない", NULL);
     }
@@ -973,5 +1009,578 @@ int SourceLatest(const SourceCfg *cfg, Latest *out) {
     else if (UsesGitHubWeb(cfg, out->kind)) out->ok = FromGitHubWeb(cfg, out);
     else if (out->kind == SRC_AMO) out->ok = FromAmo(cfg, out);
     else out->ok = FromReleases(cfg, out);
+    return out->ok;
+}
+
+// ---------------------------------------------------------------- HTML → テキスト（リリースノートと README を読むため）
+//
+// 見出しは ■ / □、箇条書きは ・ / 1. と字下げ、表のセルは | で区切る。画像とリンク先は出さない。
+
+typedef struct {
+    Buf b;
+    int nl;       // 末尾に続いている改行の数
+    int want;     // 次の文字の前に入れたい改行の数
+    int space;    // 次の文字の前に空白を 1 つ入れる
+    int spaceNl;  // その空白は改行から来た（両側が全角なら空白にしない。CSS の改行の扱いと同じ）
+    int pre;      // <pre> の中（空白をそのまま）
+    int keepNl;   // 地の文の改行も改行として扱う（AMO の説明文）
+    int glue;     // 箇条書きの記号の直後。次の文字までの改行を入れない（<li><p>… の形）
+} PlainOut;
+
+static void TOFlush(PlainOut *o) {
+    if (o->b.n && o->want > o->nl) {
+        for (int i = o->nl; i < o->want; i++) BufAddChar(&o->b, '\n');
+        o->nl = o->want;
+        o->space = 0;
+    }
+    o->want = 0;
+}
+
+static void TOBreak(PlainOut *o, int n) { if (!o->glue && n > o->want) o->want = n; }
+
+static void TOLineBreak(PlainOut *o) {
+    if (!o->b.n) return;
+    TOFlush(o);
+    BufAddChar(&o->b, '\n');
+    o->nl++;
+    o->space = 0;
+}
+
+static void TORaw(PlainOut *o, const char *s) {
+    TOFlush(o);
+    if (o->space && !o->nl && o->b.n) BufAddChar(&o->b, ' ');
+    BufAddStr(&o->b, s);
+    o->nl = 0;
+    o->space = 0;
+    o->glue = 0;
+}
+
+static void TOText(PlainOut *o, const char *s) {
+    for (; *s; s++) {
+        char c = *s;
+        if (c == '\r') continue;
+        if (o->pre) {
+            TOFlush(o);
+            BufAddChar(&o->b, c);
+            o->nl = c == '\n' ? o->nl + 1 : 0;
+        } else if (c == '\n' && o->keepNl) {
+            TOLineBreak(o);
+        } else if (c == ' ' || c == '\t' || c == '\n') {
+            if (!o->nl && o->b.n) {
+                if (!o->space) o->spaceNl = 0;
+                o->space = 1;
+                if (c == '\n') o->spaceNl = 1;
+            }
+        } else {
+            TOFlush(o);
+            int cjk = o->spaceNl && (unsigned char)c >= 0x80 && o->b.n && (unsigned char)o->b.p[o->b.n - 1] >= 0x80;
+            if (o->space && !o->nl && o->b.n && !cjk) BufAddChar(&o->b, ' ');
+            o->space = 0;
+            BufAddChar(&o->b, c);
+            o->nl = 0;
+            o->glue = 0;
+        }
+    }
+}
+
+static int TagIs(const char *name, size_t n, const char *t) { return strlen(t) == n && _strnicmp(name, t, n) == 0; }
+
+// 行末の空白を落とし、3 つ以上続く改行を 2 つにまとめ、末尾の改行を落とす
+static char *TidyText(const char *s) {
+    Buf b = {0};
+    BufAdd(&b, "", 0);
+    int nl = 0;
+    for (; *s; s++) {
+        if (*s == '\r') continue;
+        if (*s == '\n') {
+            while (b.n && (b.p[b.n - 1] == ' ' || b.p[b.n - 1] == '\t')) b.p[--b.n] = 0;
+            if (b.n && ++nl <= 2) BufAddChar(&b, '\n');
+            continue;
+        }
+        nl = 0;
+        BufAddChar(&b, *s);
+    }
+    while (b.n && (b.p[b.n - 1] == '\n' || b.p[b.n - 1] == ' ')) b.p[--b.n] = 0;
+    return BufTake(&b);
+}
+
+char *HtmlToText(const char *html, int keepNewlines) {
+    PlainOut o = {0};
+    o.keepNl = keepNewlines;
+    int skip = 0, depth = 0, cell = 0;
+    char skipTag[16] = "";
+    int isOl[16] = {0}, olNum[16] = {0};
+    const char *p = html ? html : "";
+    while (*p) {
+        if (*p != '<') {
+            size_t n = strcspn(p, "<");
+            if (!skip) {
+                char *t = DecodeEntities(p, n);
+                TOText(&o, t);
+                free(t);
+            }
+            p += n;
+            continue;
+        }
+        if (strncmp(p, "<!--", 4) == 0) {
+            const char *e = strstr(p + 4, "-->");
+            p = e ? e + 3 : p + strlen(p);
+            continue;
+        }
+        const char *gt = strchr(p, '>');
+        if (!gt) break;
+        int close = p[1] == '/';
+        const char *nm = p + 1 + close;
+        size_t nn = 0;
+        while (isalnum((unsigned char)nm[nn]) || nm[nn] == '-') nn++;
+        char *attrs = U8NDup(nm + nn, (size_t)(gt - nm - nn));
+        int selfClose = gt[-1] == '/';
+        p = gt + 1;
+        if (!nn || !attrs) { free(attrs); continue; }   // <!DOCTYPE> など
+
+        if (skip) {
+            if (TagIs(nm, nn, skipTag) && !selfClose) skip += close ? -1 : 1;
+        } else if (!close && (TagIs(nm, nn, "script") || TagIs(nm, nn, "style") || TagIs(nm, nn, "svg") ||
+                              TagIs(nm, nn, "template") || TagIs(nm, nn, "head") || TagIs(nm, nn, "noscript"))) {
+            if (!selfClose) {
+                snprintf(skipTag, sizeof(skipTag), "%.*s", (int)nn, nm);
+                skip = 1;
+            }
+        } else if (TagIs(nm, nn, "br")) {
+            TOLineBreak(&o);
+        } else if (close && (TagIs(nm, nn, "strong") || TagIs(nm, nn, "b"))) {
+            // 「**見出し**」の次の行に本文、という書き方は太字が無いと 1 行に詰まって読めないので、改行を残す
+            const char *q = p;
+            while (*q == ' ' || *q == '\t' || *q == '\r') q++;
+            if (*q == '\n' && !o.pre && !o.keepNl) {
+                TOLineBreak(&o);
+                p = q + 1;
+            }
+        } else if (nn == 2 && (nm[0] == 'h' || nm[0] == 'H') && nm[1] >= '1' && nm[1] <= '6') {
+            TOBreak(&o, 2);
+            if (!close) TORaw(&o, nm[1] <= '2' ? "■ " : "□ ");
+        } else if (TagIs(nm, nn, "ul") || TagIs(nm, nn, "ol")) {
+            TOBreak(&o, depth ? 1 : 2);
+            if (!close) {
+                if (depth < 16) {
+                    isOl[depth] = TagIs(nm, nn, "ol");
+                    const char *st = strstr(attrs, "start=\"");
+                    olNum[depth] = st ? atoi(st + 7) - 1 : 0;
+                }
+                depth++;
+            } else if (depth) {
+                depth--;
+                if (depth) TOBreak(&o, 1);
+            }
+        } else if (TagIs(nm, nn, "li")) {
+            TOBreak(&o, 1);
+            if (!close) {
+                char bullet[64] = "";
+                int d = depth ? depth - 1 : 0;
+                for (int i = 0; i < d && i < 8; i++) strcat_s(bullet, sizeof(bullet), "  ");
+                if (d < 16 && depth && isOl[d]) {
+                    char num[16];
+                    snprintf(num, sizeof(num), "%d. ", ++olNum[d]);
+                    strcat_s(bullet, sizeof(bullet), num);
+                } else {
+                    strcat_s(bullet, sizeof(bullet), "・");
+                }
+                o.space = 0;
+                TORaw(&o, bullet);
+                o.glue = 1;
+            }
+        } else if (TagIs(nm, nn, "pre")) {
+            TOBreak(&o, 2);
+            o.pre += close ? (o.pre ? -1 : 0) : 1;
+        } else if (TagIs(nm, nn, "p") || TagIs(nm, nn, "blockquote") || TagIs(nm, nn, "table") ||
+                   TagIs(nm, nn, "dl") || TagIs(nm, nn, "figure") || TagIs(nm, nn, "details")) {
+            TOBreak(&o, depth ? 1 : 2);
+        } else if (TagIs(nm, nn, "hr")) {
+            TOBreak(&o, 2);
+            TORaw(&o, "――――――――――");
+            TOBreak(&o, 2);
+        } else if (TagIs(nm, nn, "tr")) {
+            TOBreak(&o, 1);
+            cell = 0;
+        } else if (TagIs(nm, nn, "td") || TagIs(nm, nn, "th")) {
+            if (!close && cell++) {   // 比例フォントではタブで揃わないので、区切りの記号を置く
+                o.space = 0;
+                TORaw(&o, " | ");
+            }
+        } else if (TagIs(nm, nn, "input")) {
+            if (strstr(attrs, "checkbox")) TORaw(&o, strstr(attrs, "checked") ? "☑ " : "☐ ");
+        } else if (TagIs(nm, nn, "div") || TagIs(nm, nn, "section") || TagIs(nm, nn, "article") ||
+                   TagIs(nm, nn, "header") || TagIs(nm, nn, "footer") || TagIs(nm, nn, "summary") ||
+                   TagIs(nm, nn, "dt") || TagIs(nm, nn, "dd")) {
+            TOBreak(&o, 1);
+        }
+        free(attrs);
+    }
+    char *raw = BufTake(&o.b);
+    char *text = TidyText(raw);
+    free(raw);
+    return text;
+}
+
+// marker を含む開きタグから、対応する閉じタグまでの中身。入れ子になった同じ名前のタグは数えて飛ばす
+static char *InnerElement(const char *html, const char *marker) {
+    const char *m = strstr(html, marker);
+    if (!m) return NULL;
+    const char *lt = m;
+    while (lt > html && *lt != '<') lt--;
+    if (*lt != '<') return NULL;
+    char name[16];
+    size_t n = 0;
+    while (n < sizeof(name) - 1 && isalnum((unsigned char)lt[1 + n])) { name[n] = lt[1 + n]; n++; }
+    name[n] = 0;
+    const char *start = strchr(m, '>');
+    if (!n || !start) return NULL;
+    start++;
+    int depth = 1;
+    for (const char *p = start; (p = strchr(p, '<')) != NULL; p++) {
+        int close = p[1] == '/';
+        const char *q = p + 1 + close;
+        if (_strnicmp(q, name, n) != 0 || isalnum((unsigned char)q[n])) continue;
+        if (!close) depth++;
+        else if (--depth == 0) return U8NDup(start, (size_t)(p - start));
+    }
+    return NULL;
+}
+
+// ---------------------------------------------------------------- リリースノートと README
+
+void NotesFree(Notes *n) {
+    free(n->title);
+    free(n->text);
+    free(n->page);
+    memset(n, 0, sizeof(*n));
+}
+
+int SourceHasNotes(const SourceCfg *cfg) {
+    return (cfg->kind == SRC_AUTO ? SourceDetect(cfg->url) : cfg->kind) != SRC_WEB;
+}
+
+static char *FetchBody(const char *url, const char *headers, const char *what, Notes *out) {
+    HttpResp r;
+    if (!HttpGet(url, headers, 0, &r, out->err, sizeof(out->err))) return NULL;
+    if (r.status != 200) {
+        char *e = HttpErrorText(&r, what);
+        snprintf(out->err, sizeof(out->err), "%s", e);
+        free(e);
+        HttpRespFree(&r);
+        return NULL;
+    }
+    char *body = BufTake(&r.body);
+    HttpRespFree(&r);
+    return body;
+}
+
+// パスの 1 区切りとして使えるように、英数字と -._~ 以外を %XX にする
+static char *EncodeSegment(const char *s) {
+    Buf b = {0};
+    BufAdd(&b, "", 0);
+    for (; *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        if (isalnum(c) || strchr("-._~", c)) BufAddChar(&b, (char)c);
+        else { char h[4]; snprintf(h, sizeof(h), "%%%02X", c); BufAddStr(&b, h); }
+    }
+    return BufTake(&b);
+}
+
+// 言語ごとの辞書（{"ja": "…"}）でも文字列でも、中の文字列を返す
+static const char *JsonLocalized(const J *obj, const char *key) {
+    J *v = JsonGet(obj, key);
+    if (v && v->t == J_OBJ) v = v->child;
+    return v && v->t == J_STR ? v->s : NULL;
+}
+
+// <tag ...>…</tag> の中身（実体参照は戻さない）
+static char *XmlInner(const char *s, const char *end, const char *tag) {
+    char open[32], close[32];
+    snprintf(open, sizeof(open), "<%s", tag);
+    snprintf(close, sizeof(close), "</%s>", tag);
+    const char *a = strstr(s, open);
+    if (!a || a >= end) return NULL;
+    a = strchr(a, '>');
+    const char *b = a ? strstr(a, close) : NULL;
+    if (!b || b > end) return NULL;
+    return U8NDup(a + 1, (size_t)(b - a - 1));
+}
+
+typedef struct {
+    SourceKind kind;
+    UrlParts   u;
+    char       owner[256], repo[256];
+    char      *proj;     // GitLab: 入れ子のグループを含むプロジェクトのパス（%2F 区切り）
+} RepoRef;
+
+static int ParseRepo(const SourceCfg *cfg, RepoRef *r, Notes *out) {
+    memset(r, 0, sizeof(*r));
+    r->kind = cfg->kind == SRC_AUTO ? SourceDetect(cfg->url) : cfg->kind;
+    if (r->kind == SRC_WEB) { snprintf(out->err, sizeof(out->err), "Web ページにはリリースノートも README も無い"); return 0; }
+    if (!SplitUrl(cfg->url, &r->u)) { snprintf(out->err, sizeof(out->err), "URL の形式が正しくない"); return 0; }
+    char segs[16][256];
+    int ns = PathSegments(r->u.path, segs, 16);
+    if (r->kind == SRC_AMO) {
+        for (int i = 0; i + 1 < ns; i++) if (strcmp(segs[i], "addon") == 0) snprintf(r->repo, sizeof(r->repo), "%s", segs[i + 1]);
+        if (!r->repo[0]) { snprintf(out->err, sizeof(out->err), "URL にアドオンの名前が無い"); return 0; }
+        return 1;
+    }
+    if (ns < 2) { snprintf(out->err, sizeof(out->err), "URL にリポジトリ（所有者/名前）が含まれていない"); return 0; }
+    StripGitSuffix(segs[1]);
+    snprintf(r->owner, sizeof(r->owner), "%s", segs[0]);
+    snprintf(r->repo, sizeof(r->repo), "%s", segs[1]);
+    if (r->kind == SRC_GITLAB) {
+        Buf proj = {0};
+        for (int i = 0; i < ns && strcmp(segs[i], "-") != 0; i++) {
+            if (proj.n) BufAddStr(&proj, "%2F");
+            StripGitSuffix(segs[i]);
+            BufAddStr(&proj, segs[i]);
+        }
+        r->proj = BufTake(&proj);
+    }
+    return 1;
+}
+
+static void FreeRepo(RepoRef *r) {
+    free(r->u.path);
+    free(r->proj);
+}
+
+// API が返すリリース 1 件（GitHub / GitLab / Gitea）を Notes に。本文は Markdown のまま
+static void NotesFromReleaseJson(const J *rel, SourceKind kind, Notes *out) {
+    const char *name = JsonStr(rel, "name"), *tag = JsonStr(rel, "tag_name");
+    const char *body = JsonStr(rel, kind == SRC_GITLAB ? "description" : "body");
+    const char *html = JsonStr(rel, "html_url");
+    if (!html) html = JsonStr(JsonGet(rel, "_links"), "self");
+    out->title = U8Dup(name && *name ? name : tag ? tag : "");
+    char *t = TidyText(body ? body : "");
+    out->text = *t ? t : (free(t), U8Dup("（リリースノートが書かれていない）"));
+    if (html) out->page = U8Dup(html);
+    out->published = ParseIsoTime(JsonStr(rel, kind == SRC_GITLAB ? "released_at" : "published_at"));
+    out->ok = 1;
+}
+
+// GitHub は Atom フィード（/releases.atom、最新 10 件）から読む。API の回数に数えられない。
+// フィードに無い古いタグのときだけ API を 1 回使う（タグのページは本文を JavaScript で描くので読めない）。
+static int GitHubNotes(const SourceCfg *cfg, const RepoRef *r, const char *tag, Notes *out) {
+    char *want = tag && *tag ? U8Dup(tag) : NULL;
+    if (!want && !cfg->prerelease) {
+        // 最新（プレリリースを除く）のタグは /releases/latest の転送先で分かる
+        char *latest = U8Fmt("https://github.com/%s/%s/releases/latest", r->owner, r->repo);
+        HttpResp h;
+        if (HttpGet(latest, NULL, 1, &h, out->err, sizeof(out->err))) {
+            const char *t = h.finalUrl ? strstr(h.finalUrl, "/releases/tag/") : NULL;
+            if (t) {
+                char *enc = U8NDup(t + 14, strcspn(t + 14, "?#"));
+                want = PercentDecode(enc);
+                free(enc);
+            }
+            HttpRespFree(&h);
+        }
+        free(latest);
+    }
+    char *url = U8Fmt("https://github.com/%s/%s/releases.atom", r->owner, r->repo);
+    char *feed = FetchBody(url, "Accept: application/atom+xml", "リリースの一覧", out);
+    free(url);
+    if (!feed) { free(want); return 0; }
+    for (const char *e = strstr(feed, "<entry>"); e && !out->ok; e = strstr(e + 7, "<entry>")) {
+        const char *end = strstr(e, "</entry>");
+        if (!end) break;
+        const char *link = strstr(e, "<link rel=\"alternate\"");
+        const char *href = link && link < end ? strstr(link, "href=\"") : NULL;
+        if (!href || href > end) continue;
+        href += 6;
+        char *page = DecodeEntities(href, strcspn(href, "\""));
+        const char *t = strstr(page, "/releases/tag/");
+        char *etag = t ? PercentDecode(t + 14) : U8Dup("");
+        if (!want || strcmp(etag, want) == 0) {
+            char *title = XmlInner(e, end, "title"), *updated = XmlInner(e, end, "updated");
+            char *content = XmlInner(e, end, "content");
+            char *html = content ? DecodeEntities(content, strlen(content)) : U8Dup("");
+            out->title = title ? DecodeEntities(title, strlen(title)) : U8Dup(etag);
+            out->text = HtmlToText(html, 0);
+            if (!*out->text) { free(out->text); out->text = U8Dup("（リリースノートが書かれていない）"); }
+            out->published = ParseIsoTime(updated);
+            out->page = page;
+            page = NULL;
+            out->ok = 1;
+            free(title);
+            free(updated);
+            free(content);
+            free(html);
+        }
+        free(etag);
+        free(page);
+    }
+    free(feed);
+    if (!out->ok && want) {
+        char *enc = EncodeSegment(want);
+        char *api = U8Fmt("https://api.github.com/repos/%s/%s/releases/tags/%s", r->owner, r->repo, enc);
+        char *headers = GitHubApiHeaders(cfg);
+        char *body = FetchBody(api, headers, "リリース", out);
+        J *rel = body ? JsonParse(body) : NULL;
+        if (rel && rel->t == J_OBJ) NotesFromReleaseJson(rel, SRC_GITHUB, out);
+        else if (body) snprintf(out->err, sizeof(out->err), "リリースを読めない（JSON ではない）");
+        JsonFree(rel);
+        free(body);
+        free(headers);
+        free(api);
+        free(enc);
+    } else if (!out->ok) {
+        snprintf(out->err, sizeof(out->err), "リリースが 1 つも無い");
+    }
+    free(want);
+    return out->ok;
+}
+
+static int AmoNotes(const RepoRef *r, const char *ver, Notes *out) {
+    char *verBuf = NULL;
+    if (!ver || !*ver) {
+        char *api = U8Fmt("https://addons.mozilla.org/api/v5/addons/addon/%s/", r->repo);
+        char *body = FetchBody(api, "Accept: application/json", "アドオン", out);
+        J *root = body ? JsonParse(body) : NULL;
+        verBuf = U8Dup(JsonStr(JsonGet(root, "current_version"), "version"));
+        JsonFree(root);
+        free(body);
+        free(api);
+        if (!verBuf) { if (!out->err[0]) snprintf(out->err, sizeof(out->err), "公開中の版が無い"); return 0; }
+        ver = verBuf;
+    }
+    char *enc = EncodeSegment(ver);
+    char *api = U8Fmt("https://addons.mozilla.org/api/v5/addons/addon/%s/versions/%s/?lang=ja", r->repo, enc);
+    char *body = FetchBody(api, "Accept: application/json", "アドオンの版", out);
+    J *root = body ? JsonParse(body) : NULL;
+    if (root && root->t == J_OBJ) {
+        const char *notes = JsonLocalized(root, "release_notes");
+        out->title = U8Fmt("版 %s", ver);
+        out->text = notes ? HtmlToText(notes, 1) : NULL;
+        if (!out->text || !*out->text) { free(out->text); out->text = U8Dup("（この版にはリリースノートが書かれていない）"); }
+        out->page = U8Fmt("https://addons.mozilla.org/ja/firefox/addon/%s/versions/", r->repo);
+        out->published = ParseIsoTime(JsonStr(JsonGet(root, "file"), "created"));
+        out->ok = 1;
+    } else if (body) {
+        snprintf(out->err, sizeof(out->err), "アドオンの版を読めない（JSON ではない）");
+    }
+    JsonFree(root);
+    free(body);
+    free(api);
+    free(enc);
+    free(verBuf);
+    return out->ok;
+}
+
+int SourceReleaseNotes(const SourceCfg *cfg, const char *tag, Notes *out) {
+    memset(out, 0, sizeof(*out));
+    RepoRef r;
+    if (!ParseRepo(cfg, &r, out)) { FreeRepo(&r); return 0; }
+    if (r.kind == SRC_GITHUB) {
+        GitHubNotes(cfg, &r, tag, out);
+    } else if (r.kind == SRC_AMO) {
+        AmoNotes(&r, tag, out);
+    } else {
+        char *enc = tag && *tag ? EncodeSegment(tag) : NULL;
+        char *api;
+        if (r.kind == SRC_GITLAB)
+            api = enc ? U8Fmt("%s://%s/api/v4/projects/%s/releases/%s", r.u.scheme, r.u.host, r.proj, enc)
+                      : U8Fmt("%s://%s/api/v4/projects/%s/releases?per_page=1", r.u.scheme, r.u.host, r.proj);
+        else
+            api = enc ? U8Fmt("%s://%s/api/v1/repos/%s/%s/releases/tags/%s", r.u.scheme, r.u.host, r.owner, r.repo, enc)
+                      : U8Fmt("%s://%s/api/v1/repos/%s/%s/releases/latest", r.u.scheme, r.u.host, r.owner, r.repo);
+        char *body = FetchBody(api, "Accept: application/json", "リリース", out);
+        J *root = body ? JsonParse(body) : NULL;
+        J *rel = root && root->t == J_ARR ? root->child : root;
+        if (rel && rel->t == J_OBJ) NotesFromReleaseJson(rel, r.kind, out);
+        else if (body) snprintf(out->err, sizeof(out->err), root && root->t == J_ARR ? "リリースが 1 つも無い" : "リリースを読めない（JSON ではない）");
+        JsonFree(root);
+        free(body);
+        free(api);
+        free(enc);
+    }
+    FreeRepo(&r);
+    return out->ok;
+}
+
+// GitHub はリポジトリの画面に描かれた README（<article class="markdown-body …">）を読む。API は使わない。
+// GitLab / Gitea はファイルをそのまま（Markdown のまま）読む。AMO はアドオンの説明文。
+int SourceReadme(const SourceCfg *cfg, Notes *out) {
+    memset(out, 0, sizeof(*out));
+    RepoRef r;
+    if (!ParseRepo(cfg, &r, out)) { FreeRepo(&r); return 0; }
+    if (r.kind == SRC_GITHUB) {
+        char *url = U8Fmt("https://github.com/%s/%s", r.owner, r.repo);
+        char *html = FetchBody(url, "Accept: text/html", "リポジトリ", out);
+        char *inner = html ? InnerElement(html, "<article class=\"markdown-body") : NULL;
+        if (inner) {
+            out->title = U8Dup("README");
+            out->text = HtmlToText(inner, 0);
+            out->page = url;
+            url = NULL;
+            out->ok = 1;
+        } else if (html) {
+            snprintf(out->err, sizeof(out->err), "README が無い（リポジトリの画面に README が表示されていない）");
+        }
+        free(inner);
+        free(html);
+        free(url);
+    } else if (r.kind == SRC_AMO) {
+        char *api = U8Fmt("https://addons.mozilla.org/api/v5/addons/addon/%s/?lang=ja", r.repo);
+        char *body = FetchBody(api, "Accept: application/json", "アドオン", out);
+        J *root = body ? JsonParse(body) : NULL;
+        if (root && root->t == J_OBJ) {
+            const char *summary = JsonLocalized(root, "summary"), *desc = JsonLocalized(root, "description");
+            char *html = U8Fmt("%s\n\n%s", summary ? summary : "", desc ? desc : "");
+            const char *name = JsonLocalized(root, "name"), *page = JsonStr(root, "url");
+            out->title = U8Dup(name ? name : r.repo);
+            out->text = HtmlToText(html, 1);
+            out->page = U8Dup(page ? page : cfg->url);
+            out->ok = 1;
+            free(html);
+        } else if (body) {
+            snprintf(out->err, sizeof(out->err), "アドオンを読めない（JSON ではない）");
+        }
+        JsonFree(root);
+        free(body);
+        free(api);
+    } else if (r.kind == SRC_GITLAB) {
+        char *api = U8Fmt("%s://%s/api/v4/projects/%s", r.u.scheme, r.u.host, r.proj);
+        char *body = FetchBody(api, "Accept: application/json", "プロジェクト", out);
+        J *root = body ? JsonParse(body) : NULL;
+        const char *readme = JsonStr(root, "readme_url"), *web = JsonStr(root, "web_url");
+        const char *blob = readme ? strstr(readme, "/-/blob/") : NULL;
+        if (blob) {
+            char *raw = U8Fmt("%.*s/-/raw/%s", (int)(blob - readme), readme, blob + 8);
+            char *text = FetchBody(raw, NULL, "README", out);
+            if (text) {
+                out->title = U8Dup("README");
+                out->text = TidyText(text);
+                out->page = U8Dup(web ? web : cfg->url);
+                out->ok = 1;
+            }
+            free(text);
+            free(raw);
+        } else if (root) {
+            snprintf(out->err, sizeof(out->err), "README が無い");
+        }
+        JsonFree(root);
+        free(body);
+        free(api);
+    } else {
+        static const char *names[] = { "README.md", "readme.md", "README", NULL };
+        for (int i = 0; names[i] && !out->ok; i++) {
+            char *raw = U8Fmt("%s://%s/api/v1/repos/%s/%s/raw/%s", r.u.scheme, r.u.host, r.owner, r.repo, names[i]);
+            char *text = FetchBody(raw, NULL, "README", out);
+            if (text) {
+                out->title = U8Dup("README");
+                out->text = TidyText(text);
+                out->page = U8Fmt("%s://%s/%s/%s", r.u.scheme, r.u.host, r.owner, r.repo);
+                out->ok = 1;
+                out->err[0] = 0;
+            }
+            free(text);
+            free(raw);
+        }
+    }
+    FreeRepo(&r);
     return out->ok;
 }

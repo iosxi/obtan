@@ -3,6 +3,7 @@
 #define IDI_APP             1
 #define IDD_APP             100
 #define IDD_SETTINGS        101
+#define IDD_NOTES           102
 
 #define IDC_HINT1           1021
 #define IDC_HINT2           1022
@@ -26,3 +27,7 @@
 #define IDC_DEFDIR          1101
 #define IDC_DEFDIR_BROWSE   1102
 #define IDC_TOKEN           1107
+
+#define IDC_NOTES_HEAD      1201
+#define IDC_NOTES_TEXT      1202
+#define IDC_NOTES_OPEN      1203

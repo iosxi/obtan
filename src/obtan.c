@@ -44,6 +44,8 @@
 #define ID_CTX_FOLDER   203
 #define ID_CTX_MARK     204
 #define ID_CTX_UNMARK   205
+#define ID_CTX_NOTES    206
+#define ID_CTX_README   207
 
 #define TIMER_RETRY     1   // 回数制限で待っている登録を、解除の時刻が来たらやり直す
 
@@ -53,6 +55,8 @@
 #define WM_APP_IDLE     (WM_APP + 4)
 #define WM_APP_SHOWME   (WM_APP + 6)   // 二重起動されたときに前面へ
 #define WM_APP_PROBED   (WM_APP + 7)   // 登録画面へ: lParam: WCHAR*（free）
+#define WM_APP_NOTES    (WM_APP + 8)   // ノートの画面へ: lParam: Notes*（NotesFree して free）
+#define WM_APP_OPENNOTES (WM_APP + 9)  // 公開日のクリック: wParam: id
 
 enum { JOB_NONE, JOB_CHECK, JOB_DOWNLOAD };
 
@@ -70,6 +74,8 @@ typedef struct {
     WCHAR latest[128];       // 最後に確認した最新の版
     WCHAR latestName[260];
     WCHAR page[1024];
+    WCHAR tag[128];          // 最新のリリースのタグ名（リリースノートを引くのに使う）
+    long long published;     // 最新のリリースの公開日時（UNIX 秒）
     WCHAR file[MAX_PATH];    // 最後に保存したファイル
     WCHAR error[512];
     long long checked;       // 最後に確認した時刻（UNIX 秒）
@@ -97,13 +103,14 @@ typedef struct {
     long long deferUntil;    // 回数制限で見送った（この時刻に再開）
     int   skipped;           // 取得済みと同じ版だったので落とさなかった
     WCHAR err[512];
-    WCHAR version[128], fileName[260], page[1024];
+    WCHAR version[128], fileName[260], page[1024], tag[128];
+    long long published;
     WCHAR path[MAX_PATH];
 } JobResult;
 
 static HINSTANCE g_hinst;
 static HWND  g_main, g_list, g_status, g_buttons[6];
-static HFONT g_font;
+static HFONT g_font, g_fontLink;   // g_fontLink は一覧の公開日（押せる印の下線付き）
 static UINT  g_dpi = 96;
 static WCHAR g_exeDir[MAX_PATH], g_ini[MAX_PATH];
 static App **g_apps;
@@ -457,6 +464,23 @@ static void FormatTime(long long t, WCHAR *out, size_t n) {
     swprintf_s(out, n, L"%d/%02d/%02d %02d:%02d", lt.tm_year + 1900, lt.tm_mon + 1, lt.tm_mday, lt.tm_hour, lt.tm_min);
 }
 
+static void FormatDate(long long t, WCHAR *out, size_t n) {
+    FormatTime(t, out, n);
+    WCHAR *sp = wcschr(out, L' ');
+    if (sp) *sp = 0;
+}
+
+static SourceKind AppKind(const App *a) {
+    if (a->kind != SRC_AUTO) return (SourceKind)a->kind;
+    char *u = W2U(a->url);
+    SourceKind k = SourceDetect(u);
+    free(u);
+    return k;
+}
+
+// リリースノートと README を読めるか（Web ページには無い）
+static BOOL AppHasNotes(const App *a) { return AppKind(a) != SRC_WEB; }
+
 // ---------------------------------------------------------------- ini（UTF-16）
 
 static void IniGet(const WCHAR *sec, const WCHAR *key, WCHAR *out, size_t n) {
@@ -539,6 +563,8 @@ static void SaveApp(const App *a) {
     IniPut(sec, L"latest", a->latest);
     IniPut(sec, L"latestname", a->latestName);
     IniPut(sec, L"page", a->page);
+    IniPut(sec, L"tag", a->tag);
+    IniPutInt(sec, L"published", a->published);
     IniPut(sec, L"file", a->file);
     IniPut(sec, L"error", a->error);
     IniPutInt(sec, L"checked", a->checked);
@@ -558,6 +584,8 @@ static void LoadApp(App *a, const WCHAR *sec) {
     IniGet(sec, L"latest", a->latest, _countof(a->latest));
     IniGet(sec, L"latestname", a->latestName, _countof(a->latestName));
     IniGet(sec, L"page", a->page, _countof(a->page));
+    IniGet(sec, L"tag", a->tag, _countof(a->tag));
+    a->published = IniGetInt(sec, L"published", 0);
     IniGet(sec, L"file", a->file, _countof(a->file));
     IniGet(sec, L"error", a->error, _countof(a->error));
     a->checked = IniGetInt(sec, L"checked", 0);
@@ -735,6 +763,8 @@ static JobResult *RunJob(const Job *j) {
     WCopyU8(r->version, _countof(r->version), l.version);
     WCopyU8(r->fileName, _countof(r->fileName), l.fileName);
     WCopyU8(r->page, _countof(r->page), l.page);
+    WCopyU8(r->tag, _countof(r->tag), l.tag);
+    r->published = l.published;
 
     if (j->type == JOB_DOWNLOAD && j->skipSame && !VersionIsNewer(l.version, j->installed) &&
         j->file[0] && GetFileAttributesW(j->file) != INVALID_FILE_ATTRIBUTES) {
@@ -889,9 +919,9 @@ static void CheckAll(void) {
 
 // ---------------------------------------------------------------- 一覧（ListView）
 
-enum { COL_NAME, COL_INSTALLED, COL_LATEST, COL_STATE, COL_CHECKED, COL_COUNT };
-static const int g_colWidth[COL_COUNT] = { 170, 110, 110, 230, 120 };
-static const WCHAR *g_colName[COL_COUNT] = { L"名前", L"取得済みの版", L"最新の版", L"状態", L"確認した日時" };
+enum { COL_NAME, COL_INSTALLED, COL_LATEST, COL_DATE, COL_STATE, COL_CHECKED, COL_COUNT };
+static const int g_colWidth[COL_COUNT] = { 170, 100, 100, 84, 210, 120 };
+static const WCHAR *g_colName[COL_COUNT] = { L"名前", L"取得済みの版", L"最新の版", L"公開日", L"状態", L"確認した日時" };
 
 static void StateText(const App *a, WCHAR *out, size_t n) {
     if (a->busy == JOB_DOWNLOAD) {
@@ -920,12 +950,14 @@ static void ApplyListColors(void) {
 static void UpdateRow(const App *a) {
     int i = AppIndex(a->id);
     if (i < 0 || !g_list) return;
-    WCHAR state[600], checked[32];
+    WCHAR state[600], checked[32], date[32];
     StateText(a, state, _countof(state));
     FormatTime(a->checked, checked, _countof(checked));
+    FormatDate(a->published, date, _countof(date));
     ListView_SetItemText(g_list, i, COL_NAME, (LPWSTR)a->name);
     ListView_SetItemText(g_list, i, COL_INSTALLED, (LPWSTR)a->installed);
     ListView_SetItemText(g_list, i, COL_LATEST, (LPWSTR)a->latest);
+    ListView_SetItemText(g_list, i, COL_DATE, date);
     ListView_SetItemText(g_list, i, COL_STATE, state);
     ListView_SetItemText(g_list, i, COL_CHECKED, checked);
 }
@@ -1221,8 +1253,8 @@ static INT_PTR CALLBACK AppDlgProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp) {
             // 判定に関わる設定が変わったら、前の確認結果は捨てる
             if (wcscmp(n.url, a->url) || n.kind != a->kind || wcscmp(n.filter, a->filter) ||
                 wcscmp(n.verRx, a->verRx) || n.prerelease != a->prerelease) {
-                n.latest[0] = n.latestName[0] = n.error[0] = n.page[0] = 0;
-                n.checked = 0;
+                n.latest[0] = n.latestName[0] = n.error[0] = n.page[0] = n.tag[0] = 0;
+                n.checked = n.published = 0;
             }
             *a = n;
             EndDialog(dlg, IDOK);
@@ -1338,12 +1370,226 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp
     return FALSE;
 }
 
+// ---------------------------------------------------------------- リリースノートと README を読む画面
+
+typedef struct {
+    int   readme;
+    WCHAR name[128];
+    WCHAR page[1024];        // 「ブラウザで開く」の行き先（読めたらそのページに置き換える）
+    long long published;     // 一覧に出している公開日（API の公開日時。フィードの更新日時より優先する）
+    char *url, *tag, *token;
+    int   kind, prerelease;
+} NotesCtx;
+
+typedef struct {
+    HWND  dlg;
+    int   readme;
+    SourceCfg cfg;
+    char *url, *tag, *token;
+} NotesJob;
+
+static DWORD WINAPI NotesProc(void *arg) {
+    NotesJob *j = (NotesJob *)arg;
+    Notes *n = (Notes *)calloc(1, sizeof(Notes));
+    if (n) {
+        if (j->readme) SourceReadme(&j->cfg, n);
+        else SourceReleaseNotes(&j->cfg, j->tag, n);
+        if (!PostMessageW(j->dlg, WM_APP_NOTES, 0, (LPARAM)n)) { NotesFree(n); free(n); }
+    }
+    free(j->url);
+    free(j->tag);
+    free(j->token);
+    free(j);
+    return 0;
+}
+
+static void StartNotesJob(HWND dlg, const NotesCtx *c) {
+    NotesJob *j = (NotesJob *)calloc(1, sizeof(NotesJob));
+    if (!j) return;
+    j->dlg = dlg;
+    j->readme = c->readme;
+    j->url = U8Dup(c->url);
+    j->tag = U8Dup(c->tag);
+    j->token = U8Dup(c->token);
+    j->cfg.url = j->url;
+    j->cfg.kind = (SourceKind)c->kind;
+    j->cfg.prerelease = c->prerelease;
+    j->cfg.token = j->token;
+    HANDLE th = CreateThread(NULL, 4 * 1024 * 1024, NotesProc, j, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+    if (th) CloseHandle(th);
+    else { free(j->url); free(j->tag); free(j->token); free(j); }
+}
+
+// 本文の \n を、エディットが改行として扱う \r\n にする
+static WCHAR *ToEditText(const char *s) {
+    Buf b = {0};
+    BufAdd(&b, "", 0);
+    for (; s && *s; s++) {
+        if (*s == '\n') BufAddChar(&b, '\r');
+        BufAddChar(&b, *s);
+    }
+    char *u = BufTake(&b);
+    WCHAR *w = U2W(u);
+    free(u);
+    return w;
+}
+
+static void LayoutNotes(HWND dlg) {
+    RECT rc, m = { 7, 7, 4, 0 };
+    GetClientRect(dlg, &rc);
+    MapDialogRect(dlg, &m);   // left: 余白、right: 部品の間
+    HWND head = GetDlgItem(dlg, IDC_NOTES_HEAD), text = GetDlgItem(dlg, IDC_NOTES_TEXT);
+    HWND open = GetDlgItem(dlg, IDC_NOTES_OPEN), close = GetDlgItem(dlg, IDCANCEL);
+    RECT hr, br, cr;
+    GetWindowRect(head, &hr);
+    GetWindowRect(open, &br);
+    GetWindowRect(close, &cr);
+    int hh = hr.bottom - hr.top, bh = br.bottom - br.top, bw = br.right - br.left, cw = cr.right - cr.left;
+    int w = rc.right - 2 * m.left, by = rc.bottom - m.left - bh;
+    MoveWindow(head, m.left, m.left, w, hh, TRUE);
+    MoveWindow(text, m.left, m.left + hh + m.right, w, by - m.right - (m.left + hh + m.right), TRUE);
+    MoveWindow(open, m.left, by, bw, bh, TRUE);
+    MoveWindow(close, rc.right - m.left - cw, by, cw, bh, TRUE);
+}
+
+static INT_PTR CALLBACK NotesDlgProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp) {
+    NotesCtx *c = (NotesCtx *)GetWindowLongPtrW(dlg, DWLP_USER);
+    INT_PTR ret;
+    if (DialogColor(msg, wp, lp, &ret)) return ret;
+    switch (msg) {
+    case WM_INITDIALOG: {
+        c = (NotesCtx *)lp;
+        SetWindowLongPtrW(dlg, DWLP_USER, (LONG_PTR)c);
+        g_dialog = dlg;
+        WCHAR title[256];
+        swprintf_s(title, _countof(title), !c->readme ? L"%s のリリースノート" : c->kind == SRC_AMO ? L"%s の説明" : L"%s の README", c->name);
+        SetWindowTextW(dlg, title);
+        SetDlgItemTextW(dlg, IDC_NOTES_HEAD, L"読み込んでいます…");
+        SendDlgItemMessageW(dlg, IDC_NOTES_TEXT, EM_SETLIMITTEXT, 0, 0);
+        // 前回の大きさ（96 DPI 換算で保存）にして、一覧の窓の中央に置く
+        UINT dpi = GetDpiForWindow(dlg);
+        RECT wr, mr;
+        GetWindowRect(dlg, &wr);
+        int w = (int)IniGetInt(L"obtan", L"notesw", 0), h = (int)IniGetInt(L"obtan", L"notesh", 0);
+        w = w > 0 ? MulDiv(w, (int)dpi, 96) : wr.right - wr.left;
+        h = h > 0 ? MulDiv(h, (int)dpi, 96) : wr.bottom - wr.top;
+        GetWindowRect(g_main, &mr);
+        HMONITOR mon = MonitorFromWindow(g_main, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO mi = { sizeof(mi) };
+        GetMonitorInfoW(mon, &mi);
+        if (w > mi.rcWork.right - mi.rcWork.left) w = mi.rcWork.right - mi.rcWork.left;
+        if (h > mi.rcWork.bottom - mi.rcWork.top) h = mi.rcWork.bottom - mi.rcWork.top;
+        int x = (mr.left + mr.right - w) / 2, y = (mr.top + mr.bottom - h) / 2;
+        if (x < mi.rcWork.left) x = mi.rcWork.left;
+        if (y < mi.rcWork.top) y = mi.rcWork.top;
+        if (x + w > mi.rcWork.right) x = mi.rcWork.right - w;
+        if (y + h > mi.rcWork.bottom) y = mi.rcWork.bottom - h;
+        SetWindowPos(dlg, NULL, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+        LayoutNotes(dlg);
+        ApplyThemeTree(dlg);
+        StartNotesJob(dlg, c);
+        SetFocus(GetDlgItem(dlg, IDCANCEL));
+        return FALSE;
+    }
+    case WM_SIZE:
+        LayoutNotes(dlg);
+        return TRUE;
+    case WM_GETMINMAXINFO: {
+        UINT dpi = GetDpiForWindow(dlg);
+        ((MINMAXINFO *)lp)->ptMinTrackSize.x = MulDiv(360, (int)dpi, 96);
+        ((MINMAXINFO *)lp)->ptMinTrackSize.y = MulDiv(240, (int)dpi, 96);
+        return TRUE;
+    }
+    case WM_SETTINGCHANGE:
+        FollowSystemTheme(lp);
+        return TRUE;
+    case WM_DESTROY:
+        g_dialog = NULL;
+        return FALSE;
+    case WM_APP_NOTES: {
+        Notes *n = (Notes *)lp;
+        WCHAR head[600];
+        if (n->ok) {
+            WCHAR date[32], *t = U2W(n->title ? n->title : "");
+            FormatDate(!c->readme && c->published ? c->published : n->published, date, _countof(date));
+            if (n->page) WCopyU8(c->page, _countof(c->page), n->page);
+            if (date[0]) swprintf_s(head, _countof(head), L"%s（%s 公開）", t ? t : L"", date);
+            else if (c->readme) swprintf_s(head, _countof(head), L"%s　%s", t ? t : L"", c->page);
+            else WCopy(head, _countof(head), t);
+            free(t);
+        } else {
+            WCopy(head, _countof(head), c->readme ? L"読めませんでした" : L"リリースノートを読めませんでした");
+        }
+        SetDlgItemTextW(dlg, IDC_NOTES_HEAD, head);
+        WCHAR *body = ToEditText(n->ok ? n->text : n->err);
+        SetDlgItemTextW(dlg, IDC_NOTES_TEXT, body ? body : L"");
+        free(body);
+        NotesFree(n);
+        free(n);
+        return TRUE;
+    }
+    case WM_COMMAND:
+        switch (LOWORD(wp)) {
+        case IDC_NOTES_OPEN:
+            if (c->page[0]) ShellExecuteW(dlg, L"open", c->page, NULL, NULL, SW_SHOWNORMAL);
+            return TRUE;
+        case IDOK:
+        case IDCANCEL: {
+            WINDOWPLACEMENT wpl = { sizeof(wpl) };
+            if (GetWindowPlacement(dlg, &wpl)) {   // 最大化していても元の大きさを残す
+                UINT dpi = GetDpiForWindow(dlg);
+                RECT *r = &wpl.rcNormalPosition;
+                IniPutInt(L"obtan", L"notesw", MulDiv(r->right - r->left, 96, (int)dpi));
+                IniPutInt(L"obtan", L"notesh", MulDiv(r->bottom - r->top, 96, (int)dpi));
+            }
+            EndDialog(dlg, IDCANCEL);
+            return TRUE;
+        }
+        }
+        break;
+    }
+    return FALSE;
+}
+
+static void ShowNotes(const App *a, int readme) {
+    if (!AppHasNotes(a)) return;
+    NotesCtx c = {0};
+    c.readme = readme;
+    WCopy(c.name, _countof(c.name), a->name);
+    // 読み込む前・読めなかったときの行き先: リリースノートは最新のリリースのページ、README は登録した URL
+    WCopy(c.page, _countof(c.page), !readme && a->page[0] ? a->page : a->url);
+    c.published = a->published;
+    c.url = W2U(a->url);
+    c.tag = W2U(a->tag);
+    c.token = W2U(g_token);
+    c.kind = AppKind(a);
+    c.prerelease = a->prerelease;
+    DialogBoxParamW(g_hinst, MAKEINTRESOURCEW(IDD_NOTES), g_main, NotesDlgProc, (LPARAM)&c);
+    free(c.url);
+    free(c.tag);
+    free(c.token);
+}
+
 // ---------------------------------------------------------------- 主画面
 
 static void RecreateFont(void) {
     if (g_font) DeleteObject(g_font);
-    g_font = CreateFontW(-MulDiv(9, (int)g_dpi, 72), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-                         OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Yu Gothic UI");
+    if (g_fontLink) DeleteObject(g_fontLink);
+    for (int u = 0; u < 2; u++) {
+        HFONT f = CreateFontW(-MulDiv(9, (int)g_dpi, 72), 0, 0, 0, FW_NORMAL, FALSE, u, FALSE, DEFAULT_CHARSET,
+                              OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Yu Gothic UI");
+        if (u) g_fontLink = f;
+        else g_font = f;
+    }
+}
+
+// 一覧の pt（一覧のクライアント座標）が、押せる公開日の上なら、その行の番号
+static int DateCellAt(POINT pt) {
+    LVHITTESTINFO ht = {0};
+    ht.pt = pt;
+    if (ListView_SubItemHitTest(g_list, &ht) < 0 || ht.iItem < 0 || ht.iItem >= g_napps || ht.iSubItem != COL_DATE) return -1;
+    const App *a = g_apps[ht.iItem];
+    return a->published && AppHasNotes(a) ? ht.iItem : -1;
 }
 
 static void LayoutMain(void) {
@@ -1387,6 +1633,15 @@ static void ApplyFonts(void) {
 // 見出しの文字色はテーマ任せだとダークで黒くなるので、一覧のサブクラスで指定する
 static LRESULT CALLBACK ListSubclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR id, DWORD_PTR ref) {
     (void)id; (void)ref;
+    if (msg == WM_SETCURSOR && LOWORD(lp) == HTCLIENT) {   // 公開日はリンクのように指の形にする
+        POINT pt;
+        GetCursorPos(&pt);
+        ScreenToClient(hwnd, &pt);
+        if (DateCellAt(pt) >= 0) {
+            SetCursor(LoadCursor(NULL, IDC_HAND));
+            return TRUE;
+        }
+    }
     if (msg == WM_NOTIFY && ((NMHDR *)lp)->code == NM_CUSTOMDRAW && ((NMHDR *)lp)->hwndFrom == ListView_GetHeader(hwnd)) {
         NMCUSTOMDRAW *cd = (NMCUSTOMDRAW *)lp;
         if (cd->dwDrawStage == CDDS_PREPAINT) return CDRF_NOTIFYITEMDRAW;
@@ -1407,6 +1662,9 @@ static void ShowContextMenu(int x, int y) {
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_STRING, ID_EDIT, L"編集...");
     AppendMenuW(m, MF_STRING, ID_CTX_PAGE, L"ページを開く");
+    UINT notes = AppHasNotes(a) ? 0 : MF_GRAYED;
+    AppendMenuW(m, MF_STRING | notes, ID_CTX_NOTES, L"リリースノートを読む...");
+    AppendMenuW(m, MF_STRING | notes, ID_CTX_README, AppKind(a) == SRC_AMO ? L"説明を読む..." : L"README を読む...");
     AppendMenuW(m, MF_STRING, ID_CTX_FOLDER, L"保存先を開く");
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_STRING | (a->latest[0] ? 0 : MF_GRAYED), ID_CTX_MARK, L"取得済みにする（今の最新の版で）");
@@ -1471,11 +1729,13 @@ static void OnCommand(int id) {
         n = SelectedIds(ids, 512);
         for (int k = 0; k < n; k++) Enqueue(FindApp(ids[k]), JOB_CHECK);
         break;
-    case ID_CTX_PAGE: {
+    case ID_CTX_PAGE: {   // 登録した URL そのもの（最新のリリースのページはノートの画面から開ける）
         App *a = FocusedApp();
-        if (a) ShellExecuteW(g_main, L"open", a->page[0] ? a->page : a->url, NULL, NULL, SW_SHOWNORMAL);
+        if (a) ShellExecuteW(g_main, L"open", a->url, NULL, NULL, SW_SHOWNORMAL);
         break;
     }
+    case ID_CTX_NOTES:
+    case ID_CTX_README: { App *a = FocusedApp(); if (a) ShowNotes(a, id == ID_CTX_README); break; }
     case ID_CTX_FOLDER: { App *a = FocusedApp(); if (a) OpenFolderOf(a); break; }
     case ID_CTX_MARK:
     case ID_CTX_UNMARK:
@@ -1511,6 +1771,8 @@ static void OnJobDone(JobResult *r) {
         WCopy(a->latest, _countof(a->latest), r->version);
         WCopy(a->latestName, _countof(a->latestName), r->fileName);
         WCopy(a->page, _countof(a->page), r->page);
+        WCopy(a->tag, _countof(a->tag), r->tag);
+        a->published = r->published;
         a->error[0] = 0;
     } else {
         WCopy(a->error, _countof(a->error), r->err);
@@ -1562,8 +1824,15 @@ static LRESULT OnListNotify(NMHDR *h) {
         UpdateStatusBar();
         return 0;
     }
+    case NM_CLICK: {
+        // 公開日を押すとリリースノート（Obtainium と同じ）。一覧の処理の途中なので、開くのは後で
+        NMITEMACTIVATE *ia = (NMITEMACTIVATE *)h;
+        int i = ia->uKeyFlags ? -1 : DateCellAt(ia->ptAction);
+        if (i >= 0) PostMessageW(g_main, WM_APP_OPENNOTES, (WPARAM)g_apps[i]->id, 0);
+        return 0;
+    }
     case NM_DBLCLK:
-        if (((NMITEMACTIVATE *)h)->iItem >= 0) OnCommand(ID_EDIT);
+        if (((NMITEMACTIVATE *)h)->iItem >= 0 && DateCellAt(((NMITEMACTIVATE *)h)->ptAction) < 0) OnCommand(ID_EDIT);
         return 0;
     case NM_RCLICK: {
         POINT pt;
@@ -1582,16 +1851,23 @@ static LRESULT OnListNotify(NMHDR *h) {
     case NM_CUSTOMDRAW: {
         NMLVCUSTOMDRAW *cd = (NMLVCUSTOMDRAW *)h;
         if (cd->nmcd.dwDrawStage == CDDS_PREPAINT) return CDRF_NOTIFYITEMDRAW;
-        if (cd->nmcd.dwDrawStage == CDDS_ITEMPREPAINT) {
+        if (cd->nmcd.dwDrawStage == CDDS_ITEMPREPAINT) return CDRF_NOTIFYSUBITEMDRAW;
+        if (cd->nmcd.dwDrawStage == (CDDS_ITEMPREPAINT | CDDS_SUBITEM)) {
             int i = (int)cd->nmcd.dwItemSpec;
+            HFONT font = g_font;
             if (i >= 0 && i < g_napps) {
                 const App *a = g_apps[i];
                 if (!a->enabled && !a->busy && !a->queued) cd->clrText = ThemeHint();
                 else if (a->error[0] && !a->busy && !a->queued) cd->clrText = ThemeError();
                 else if (AppHasUpdate(a) || a->busy == JOB_DOWNLOAD) cd->clrText = ThemeAccent();
                 else cd->clrText = ThemeText();
+                if (cd->iSubItem == COL_DATE && a->published && AppHasNotes(a)) {   // 押せる公開日
+                    if (a->enabled) cd->clrText = ThemeAccent();
+                    font = g_fontLink;
+                }
             }
-            return CDRF_DODEFAULT;
+            SelectObject(cd->nmcd.hdc, font);
+            return CDRF_NEWFONT;
         }
         return CDRF_DODEFAULT;
     }
@@ -1712,6 +1988,11 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_APP_SHOWME:
         ShowMain();
         return 0;
+    case WM_APP_OPENNOTES: {
+        App *a = FindApp((int)wp);
+        if (a && !g_dialog) ShowNotes(a, 0);
+        return 0;
+    }
     case WM_ENDSESSION:
         if (wp) DestroyWindow(hwnd);
         return 0;
@@ -1849,6 +2130,54 @@ static int SelfTest(void) {
     return fail ? 1 : 0;
 }
 
+static SourceKind ParseKind(const WCHAR *s) {
+    if (!_wcsicmp(s, L"github")) return SRC_GITHUB;
+    if (!_wcsicmp(s, L"gitlab")) return SRC_GITLAB;
+    if (!_wcsicmp(s, L"gitea")) return SRC_GITEA;
+    if (!_wcsicmp(s, L"web")) return SRC_WEB;
+    if (!_wcsicmp(s, L"amo")) return SRC_AMO;
+    return SRC_AUTO;
+}
+
+// -notes <url> [-tag t] [-kind k] [-pre] [-token t] / -readme <url> [-kind k]
+static int CmdNotes(int argc, WCHAR **argv) {
+    char *url = NULL, *tag = NULL, *token = NULL;
+    SourceKind kind = SRC_AUTO;
+    int pre = 0, readme = 0;
+    for (int i = 1; i < argc; i++) {
+        if ((!_wcsicmp(argv[i], L"-notes") || !_wcsicmp(argv[i], L"-readme")) && i + 1 < argc) {
+            readme = !_wcsicmp(argv[i], L"-readme");
+            url = W2U(argv[++i]);
+        }
+        else if (!_wcsicmp(argv[i], L"-tag") && i + 1 < argc) tag = W2U(argv[++i]);
+        else if (!_wcsicmp(argv[i], L"-token") && i + 1 < argc) token = W2U(argv[++i]);
+        else if (!_wcsicmp(argv[i], L"-kind") && i + 1 < argc) kind = ParseKind(argv[++i]);
+        else if (!_wcsicmp(argv[i], L"-pre")) pre = 1;
+    }
+    SourceCfg cfg = { url ? url : "", kind, NULL, NULL, pre, token, 0 };
+    Notes n;
+    if (readme) SourceReadme(&cfg, &n);
+    else SourceReleaseNotes(&cfg, tag, &n);
+    char *line;
+    if (n.ok) {
+        WCHAR t[32];
+        FormatTime(n.published, t, _countof(t));
+        char *pub = W2U(t);
+        line = U8Fmt("見出し: %s\nページ: %s\n公開: %s\n\n%s\n", n.title ? n.title : "", n.page ? n.page : "", pub, n.text ? n.text : "");
+        free(pub);
+    } else {
+        line = U8Fmt("エラー: %s\n", n.err);
+    }
+    Out(line);
+    free(line);
+    int rc = n.ok ? 0 : 1;
+    NotesFree(&n);
+    free(url);
+    free(tag);
+    free(token);
+    return rc;
+}
+
 // -probe <url> [-kind github|gitlab|gitea|web|amo] [-filter re] [-ver re] [-pre] [-noapi] [-token t] [-dl dir]
 static int Probe(int argc, WCHAR **argv) {
     char *url = NULL, *filter = NULL, *ver = NULL, *token = NULL;
@@ -1863,14 +2192,7 @@ static int Probe(int argc, WCHAR **argv) {
         else if (!_wcsicmp(argv[i], L"-dl") && i + 1 < argc) dl = argv[++i];
         else if (!_wcsicmp(argv[i], L"-pre")) pre = 1;
         else if (!_wcsicmp(argv[i], L"-noapi")) noApi = 1;
-        else if (!_wcsicmp(argv[i], L"-kind") && i + 1 < argc) {
-            i++;
-            if (!_wcsicmp(argv[i], L"github")) kind = SRC_GITHUB;
-            else if (!_wcsicmp(argv[i], L"gitlab")) kind = SRC_GITLAB;
-            else if (!_wcsicmp(argv[i], L"gitea")) kind = SRC_GITEA;
-            else if (!_wcsicmp(argv[i], L"web")) kind = SRC_WEB;
-            else if (!_wcsicmp(argv[i], L"amo")) kind = SRC_AMO;
-        }
+        else if (!_wcsicmp(argv[i], L"-kind") && i + 1 < argc) kind = ParseKind(argv[++i]);
     }
     SourceCfg cfg = { url, kind, filter, ver, pre, token, noApi };
     Latest l;
@@ -1924,6 +2246,7 @@ int WINAPI wWinMain(HINSTANCE hinst, HINSTANCE prev, PWSTR cmd, int show) {
         if (!_wcsicmp(argv[i], L"-ini") && i + 1 < argc) iniOverride = argv[++i];
         else if (!_wcsicmp(argv[i], L"-selftest")) { OutInit(); return SelfTest(); }
         else if (!_wcsicmp(argv[i], L"-probe")) { OutInit(); NetInit(); return Probe(argc, argv); }
+        else if (!_wcsicmp(argv[i], L"-notes") || !_wcsicmp(argv[i], L"-readme")) { OutInit(); NetInit(); return CmdNotes(argc, argv); }
     }
 
     // 二重起動しない（既存のウィンドウを前面へ）。-ini を指定したときは別の一覧として並べて動かせる
@@ -1973,7 +2296,7 @@ int WINAPI wWinMain(HINSTANCE hinst, HINSTANCE prev, PWSTR cmd, int show) {
         HDC dc = GetDC(NULL);
         int sdpi = GetDeviceCaps(dc, LOGPIXELSX);
         ReleaseDC(NULL, dc);
-        w = MulDiv(820, sdpi, 96);
+        w = MulDiv(860, sdpi, 96);
         h = MulDiv(440, sdpi, 96);
     }
     WCHAR title[MAX_PATH + 64] = L"obtan - アプリの新しい版を見張る";
@@ -1995,6 +2318,7 @@ int WINAPI wWinMain(HINSTANCE hinst, HINSTANCE prev, PWSTR cmd, int show) {
     InterlockedExchange(&g_cancel, 1);
     for (int i = 0; i < 30 && WorkerBusy(); i++) Sleep(100);
     if (g_font) DeleteObject(g_font);
+    if (g_fontLink) DeleteObject(g_fontLink);
     if (mutex) CloseHandle(mutex);
     LocalFree(argv);
     return 0;
